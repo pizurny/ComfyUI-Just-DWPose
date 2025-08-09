@@ -1,0 +1,6 @@
+Pillow
+numpy
+# Optional later (don’t install yet):
+# onnxruntime
+# onnxruntime-gpu
+# controlnet-aux
