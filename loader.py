@@ -167,4 +167,134 @@ def _yolox_detect_person(img_rgb: np.ndarray, conf_thres=0.25, nms_thres=0.5) ->
 # COCO-17 skeleton pairs for drawing
 _COCO_PAIRS = [
     (0,1),(0,2),(1,3),(2,4),(5,7),(7,9),(6,8),(8,10),
-    (5,6),(5,11),(6,12),(11,12),(11,13),(13,
+    (5,6),(5,11),(6,12),(11,12),(11,13),(13,15),(12,14),(14,16)
+]
+
+def _crop_expand(img: np.ndarray, box: np.ndarray, expand=1.25) -> Tuple[np.ndarray, Tuple[int,int]]:
+    x0, y0, x1, y1 = box.astype(int)
+    cx, cy = (x0+x1)/2, (y0+y1)/2
+    w, h = (x1-x0), (y1-y0)
+    s = int(max(w, h) * expand)
+    nx0 = int(max(cx - s/2, 0)); ny0 = int(max(cy - s/2, 0))
+    nx1 = int(min(cx + s/2, img.shape[1]-1)); ny1 = int(min(cy + s/2, img.shape[0]-1))
+    crop = img[ny0:ny1, nx0:nx1]
+    return crop, (nx0, ny0)
+
+def _pose_infer(crop_rgb: np.ndarray) -> np.ndarray:
+    """
+    Returns keypoints array [17,3] with (x, y, score) in crop coordinates.
+    The DWpose ONNX in practice outputs either keypoints directly (N,17,3) or heatmaps.
+    We handle both: if heatmaps come, take argmax per joint.
+    """
+    _ensure_onnx(get_models_dir())
+    # prepare 384x384
+    size = 384
+    pil = Image.fromarray(crop_rgb).resize((size, size), Image.BILINEAR)
+    x = np.asarray(pil).astype(np.float32) / 255.0
+    x = np.transpose(x, (2,0,1))[None, ...]  # 1x3x384x384
+
+    sess = _POSE_SESS
+    input_name = sess.get_inputs()[0].name
+    out = sess.run(None, {input_name: x})
+    y = out[0]
+
+    # case A: direct keypoints (1,17,3)
+    if y.ndim == 3 and y.shape[-2] == 17 and y.shape[-1] == 3:
+        return y[0]
+
+    # case B: heatmaps (1,17,H,W) -> argmax
+    if y.ndim == 4 and y.shape[1] >= 17:
+        hm = y[0, :17, :, :]  # 17xHxW
+        H, W = hm.shape[-2], hm.shape[-1]
+        flat_idx = hm.reshape(17, -1).argmax(axis=1)
+        ys = (flat_idx // W).astype(np.float32)
+        xs = (flat_idx %  W).astype(np.float32)
+        scores = hm.max(axis=(1,2))
+        # map to 384x384
+        xs = xs * (size / W)
+        ys = ys * (size / H)
+        return np.stack([xs, ys, scores], axis=1)
+
+    raise RuntimeError("Unexpected DWpose ONNX output shape: {}".format([a.shape for a in out]))
+
+def _to_image_and_json(img_rgb: np.ndarray, box: np.ndarray, kp_crop: np.ndarray, crop_origin: Tuple[int,int]) -> Tuple[Image.Image, Dict[str, Any]]:
+    """
+    Convert crop keypoints to full-image coordinates, draw, and format OpenPose-style JSON.
+    """
+    size = 384
+    # Map crop coords back
+    ox, oy = crop_origin
+    # If crop was resized to 384x384, scale back by crop size / 384
+    crop_w = box[2] - box[0]
+    crop_h = box[3] - box[1]
+    scale_x = crop_w / size
+    scale_y = crop_h / size
+
+    pts = []
+    for i in range(17):
+        x = float(kp_crop[i,0] * scale_x + ox)
+        y = float(kp_crop[i,1] * scale_y + oy)
+        c = float(max(0.0, min(1.0, kp_crop[i,2])))
+        pts.append((x,y,c))
+
+    # draw
+    canvas = Image.fromarray(img_rgb.copy())
+    draw = ImageDraw.Draw(canvas)
+    for (i,j) in _COCO_PAIRS:
+        xi, yi, ci = pts[i]
+        xj, yj, cj = pts[j]
+        if ci > 0.1 and cj > 0.1:
+            draw.line([(xi,yi),(xj,yj)], width=3)
+    for (x,y,c) in pts:
+        if c > 0.1:
+            r = 3
+            draw.ellipse((x-r,y-r,x+r,y+r), width=2)
+
+    # OpenPose-like JSON (flat list x,y,c for 17 keypoints)
+    people = [{
+        "pose_keypoints_2d": sum(([p[0], p[1], p[2]] for p in pts), []),
+        "score": float(np.mean([p[2] for p in pts])),
+    }]
+    return canvas, {"version": 1.0, "people": people}
+
+# -------------------- public API --------------------
+def run_dwpose_once(
+    pil_image: Image.Image,
+    backend: str,
+    detect_resolution: int,
+    include_body: bool,
+    include_hands: bool,
+    include_face: bool,
+    models_dir: Path,
+    offline_ok: bool,
+    allow_download: bool,
+) -> Tuple[Image.Image, Dict[str, Any]]:
+    """
+    Standalone ONNX implementation:
+      - YOLOX (person) -> pick the largest person box
+      - DWpose -> 17 keypoints
+      - Returns (pose image PIL, OpenPose-like JSON dict)
+    Notes:
+      - Hands/Face flags are placeholders for now (future sub-models).
+      - detect_resolution is used implicitly by fixed 640/384 sizes.
+    """
+    _prepare_env(models_dir, offline_ok)
+    chosen = _pick_backend(models_dir, backend)
+    if chosen != "onnx":
+        # see _pick_backend note
+        raise RuntimeError("Use backend='onnx' for the current standalone build.")
+
+    img_rgb = np.asarray(pil_image.convert("RGB"))
+    boxes = _yolox_detect_person(img_rgb, conf_thres=0.25, nms_thres=0.5)
+    if not boxes:
+        # return original + empty json
+        return Image.fromarray(img_rgb), {"version": 1.0, "people": []}
+
+    # choose largest person
+    areas = [(b[2]-b[0])*(b[3]-b[1]) for b in boxes]
+    box = boxes[int(np.argmax(areas))]
+
+    crop, origin = _crop_expand(img_rgb, box, expand=1.25)
+    keypoints = _pose_infer(crop)
+    pose_img, json_dict = _to_image_and_json(img_rgb, box, keypoints, origin)
+    return pose_img, json_dict
