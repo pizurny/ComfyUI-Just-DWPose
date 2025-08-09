@@ -165,50 +165,82 @@ def _crop_expand(img: np.ndarray, box: np.ndarray, expand=1.25) -> Tuple[np.ndar
 
 def _pose_infer(crop_rgb: np.ndarray, models_dir: Path) -> np.ndarray:
     """
-    Returns keypoints array [17,3] with (x, y, score) in **input (288x384)** coordinates.
-    DWPose UCoco ONNX expects NCHW with H=384, W=288.
+    Returns keypoints [17,3] (x,y,score) in the 288x384 input coordinate system.
+    Handles UCoco/WholeBody ONNX that emits flattened heatmaps.
     """
     _ensure_onnx(models_dir)
     IN_W, IN_H = 288, 384  # (W,H)
     pil = Image.fromarray(crop_rgb).resize((IN_W, IN_H), Image.BILINEAR)
     x = np.asarray(pil).astype(np.float32) / 255.0
-    x = np.transpose(x, (2,0,1))[None, ...]  # 1x3x384x288 AFTER (C,H,W)
+    x = np.transpose(x, (2, 0, 1))[None, ...]  # (1,3,384,288)
 
     sess = _POSE_SESS
     input_name = sess.get_inputs()[0].name
-    # Make sure the NCHW is (1,3,384,288)
     if x.shape[2] != IN_H or x.shape[3] != IN_W:
         raise RuntimeError(f"Bad input to DWpose: expected (1,3,384,288), got {x.shape}")
 
     out = sess.run(None, {input_name: x})
-    y = out[0]
 
-    # case A: direct keypoints (1,17,3) — assume pixel coords in 288x384 space or 0..1 normalized
-    if y.ndim == 3 and y.shape[1] == 17 and y.shape[2] == 3:
-        kp = y[0].astype(np.float32)
-        # if coordinates look normalized, scale them
-        if kp[:,0].max() <= 2.0 and kp[:,1].max() <= 2.0:
-            kp[:,0] *= IN_W
-            kp[:,1] *= IN_H
-        kp[:,0] = np.clip(kp[:,0], 0, IN_W-1)
-        kp[:,1] = np.clip(kp[:,1], 0, IN_H-1)
-        kp[:,2] = np.clip(kp[:,2], 0, 1)
+    # Case 1: direct keypoints (e.g., (1,17,3) or (1,133,3))
+    if len(out) == 1 and out[0].ndim == 3 and out[0].shape[0] == 1 and out[0].shape[2] == 3:
+        kp = out[0][0].astype(np.float32)  # (C,3)
+        # If WholeBody (133), take first 17 as COCO body
+        if kp.shape[0] >= 17:
+            kp = kp[:17]
+        # If coordinates look normalized, scale them
+        if kp[:, 0].max() <= 2.0 and kp[:, 1].max() <= 2.0:
+            kp[:, 0] *= IN_W
+            kp[:, 1] *= IN_H
+        kp[:, 0] = np.clip(kp[:, 0], 0, IN_W - 1)
+        kp[:, 1] = np.clip(kp[:, 1], 0, IN_H - 1)
+        kp[:, 2] = np.clip(kp[:, 2], 0, 1)
         return kp
 
-    # case B: heatmaps (1,17,H,W) -> argmax per joint
-    if y.ndim == 4 and y.shape[1] >= 17:
-        hm = y[0, :17, :, :]     # 17 x H x W
-        H, W = hm.shape[-2], hm.shape[-1]
-        flat_idx = hm.reshape(17, -1).argmax(axis=1)
-        ys = (flat_idx // W).astype(np.float32)
-        xs = (flat_idx %  W).astype(np.float32)
-        scores = hm.max(axis=(1,2))
-        # map to 288x384 input space
-        xs = xs * (IN_W / W)
-        ys = ys * (IN_H / H)
-        return np.stack([xs, ys, scores], axis=1).astype(np.float32)
+    # Case 2: heatmaps (typical). UCoco WholeBody often returns TWO tensors like:
+    #   (1,133,576) and (1,133,768) which are flattened H'*W' maps.
+    # For 384x288 input, stride≈12 => H'=32, W'=24, so H'*W' = 32*24 = 768.
+    # We’ll pick the tensor with the larger last-dim as the heatmap blob.
+    def _try_heatmaps(arr):
+        if arr.ndim != 3 or arr.shape[0] != 1:
+            return None
+        C, S = arr.shape[1], arr.shape[2]
+        if C < 17:
+            return None
+        Hc, Wc = IN_H // 12, IN_W // 12  # 32, 24
+        if S == Hc * Wc:  # 32*24 = 768
+            hm = arr.reshape(1, C, Hc, Wc)
+            return hm
+        return None
 
-    raise RuntimeError(f"Unexpected DWpose ONNX output shape: {[a.shape for a in out]}")
+    hm = None
+    # Try single-output 4D (1,C,H,W)
+    if len(out) == 1 and out[0].ndim == 4 and out[0].shape[0] == 1 and out[0].shape[1] >= 17:
+        hm = out[0]
+    # Try the two-tensor flattened style
+    if hm is None and len(out) == 2:
+        # choose the one that matches H'*W'
+        hm = _try_heatmaps(out[0])
+        if hm is None:
+            hm = _try_heatmaps(out[1])
+
+    if hm is None:
+        raise RuntimeError(f"Unexpected DWpose ONNX output shape(s): {[a.shape for a in out]}")
+
+    # Use COCO body (first 17 channels)
+    hm = hm[0, :17, :, :]  # (17,Hc,Wc)
+    Hc, Wc = hm.shape[-2], hm.shape[-1]
+    flat = hm.reshape(17, -1)
+    idx = flat.argmax(axis=1)
+    ys = (idx // Wc).astype(np.float32)
+    xs = (idx %  Wc).astype(np.float32)
+    scores = hm.max(axis=(1, 2))
+
+    # Map low-res grid -> 288x384 input space
+    xs *= (IN_W / Wc)
+    ys *= (IN_H / Hc)
+    kp = np.stack([xs, ys, scores], axis=1).astype(np.float32)
+    return kp
+
 
 def _to_image_and_json(img_rgb: np.ndarray, crop_rect: Tuple[int,int,int,int], kp_in: np.ndarray) -> Tuple[Image.Image, Dict[str, Any]]:
     """
