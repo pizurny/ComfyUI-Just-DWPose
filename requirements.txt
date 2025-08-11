@@ -2,4 +2,4 @@ Pillow
 numpy
 onnxruntime
 onnxruntime-gpu
-controlnet-aux
+
