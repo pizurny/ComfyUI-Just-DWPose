@@ -21,6 +21,8 @@ class DWPoseAnnotator:
                 "include_face": ("BOOLEAN", {"default": True}),
                 "offline_ok": ("BOOLEAN", {"default": True}),
                 "allow_download": ("BOOLEAN", {"default": False}),
+                "detection_threshold": ("FLOAT", {"default": 0.3, "min": 0.05, "max": 0.9, "step": 0.05}),
+                "nms_threshold": ("FLOAT", {"default": 0.45, "min": 0.1, "max": 0.9, "step": 0.05}),
             },
             "optional": {"model_dir_override": ("STRING", {"default": ""})},
         }
@@ -47,6 +49,8 @@ class DWPoseAnnotator:
         include_face: bool,
         offline_ok: bool,
         allow_download: bool,
+        detection_threshold: float,
+        nms_threshold: float,
         model_dir_override: str = "",
     ) -> Tuple[torch.Tensor, str]:
 
@@ -74,6 +78,8 @@ class DWPoseAnnotator:
                 models_dir=models_dir,
                 offline_ok=offline_ok,
                 allow_download=allow_download,
+                detection_threshold=detection_threshold,
+                nms_threshold=nms_threshold,
             )
             pose_images.append(self._pil_to_tensor(pose_pil))
             all_keypoints.append(kp_dict)
