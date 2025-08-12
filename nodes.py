@@ -30,12 +30,12 @@ class DWPoseAnnotator:
     FUNCTION = "run"
 
     def _tensor_to_pil(self, t: torch.Tensor) -> Image.Image:
-        arr = (t[0].detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+        arr = (t.detach().cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
         return Image.fromarray(arr, "RGB")
 
     def _pil_to_tensor(self, img: Image.Image) -> torch.Tensor:
         arr = np.asarray(img, dtype=np.uint8).astype(np.float32) / 255.0
-        return torch.from_numpy(arr).unsqueeze(0)
+        return torch.from_numpy(arr)
 
     def run(
         self,
@@ -56,15 +56,32 @@ class DWPoseAnnotator:
             else get_models_dir()
         )
 
-        pose_pil, kp_dict = run_dwpose_once(
-            self._tensor_to_pil(image),
-            backend=backend,
-            detect_resolution=int(detect_resolution),
-            include_body=include_body,
-            include_hands=include_hands,
-            include_face=include_face,
-            models_dir=models_dir,
-            offline_ok=offline_ok,
-            allow_download=allow_download,
-        )
-        return self._pil_to_tensor(pose_pil), json.dumps(kp_dict, ensure_ascii=False)
+        # Handle batch processing - image tensor shape is [Batch, Height, Width, Channels]
+        batch_size = image.shape[0]
+        pose_images = []
+        all_keypoints = []
+        
+        for i in range(batch_size):
+            # Process each image in the batch
+            single_image = image[i]  # Shape: [Height, Width, Channels]
+            pose_pil, kp_dict = run_dwpose_once(
+                self._tensor_to_pil(single_image),
+                backend=backend,
+                detect_resolution=int(detect_resolution),
+                include_body=include_body,
+                include_hands=include_hands,
+                include_face=include_face,
+                models_dir=models_dir,
+                offline_ok=offline_ok,
+                allow_download=allow_download,
+            )
+            pose_images.append(self._pil_to_tensor(pose_pil))
+            all_keypoints.append(kp_dict)
+        
+        # Stack all processed images back into batch format [Batch, Height, Width, Channels]
+        batch_pose_tensor = torch.stack(pose_images, dim=0)
+        
+        # Combine all keypoints into a single JSON string
+        combined_keypoints = json.dumps(all_keypoints, ensure_ascii=False)
+        
+        return batch_pose_tensor, combined_keypoints
