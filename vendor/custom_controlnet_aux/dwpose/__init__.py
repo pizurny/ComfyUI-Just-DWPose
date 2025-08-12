@@ -20,7 +20,7 @@ from .types import PoseResult, HandResult, FaceResult, AnimalPoseResult
 from huggingface_hub import hf_hub_download
 from .wholebody import Wholebody
 import warnings
-from custom_controlnet_aux.util import HWC3, resize_image_with_pad, common_input_validate, custom_hf_download
+from ..util import HWC3, resize_image_with_pad, common_input_validate, custom_hf_download
 import cv2
 from PIL import Image
 from .animalpose import AnimalPoseImage
@@ -228,12 +228,9 @@ class DwposeDetector:
     def from_pretrained(cls, pretrained_model_or_path, pretrained_det_model_or_path=None, det_filename=None, pose_filename=None, torchscript_device="cuda"):
         global global_cached_dwpose
         pretrained_det_model_or_path = pretrained_det_model_or_path or pretrained_model_or_path
-
+        det_filename = det_filename or "yolox_l.onnx"
         pose_filename = pose_filename or "dw-ll_ucoco_384.onnx"
-        
-        det_model_path = None
-        if det_filename is not None:
-            det_model_path = custom_hf_download(pretrained_det_model_or_path, det_filename)
+        det_model_path = custom_hf_download(pretrained_det_model_or_path, det_filename)
         pose_model_path = custom_hf_download(pretrained_model_or_path, pose_filename)
         
         print(f"\nDWPose: Using {det_filename} for bbox detection and {pose_filename} for pose estimation")
