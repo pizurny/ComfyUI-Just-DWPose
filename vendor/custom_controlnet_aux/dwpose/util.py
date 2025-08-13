@@ -101,6 +101,9 @@ def draw_bodypose(canvas: np.ndarray, keypoints: List[Keypoint], xinsr_stick_sca
 
     CH, CW, _ = canvas.shape
     stickwidth = 4
+    
+    # Calculate max reasonable bone length (40% of image diagonal) to prevent elongated bones
+    max_bone_length = 0.4 * ((CH**2 + CW**2)**0.5)
 
     # Ref: https://huggingface.co/xinsir/controlnet-openpose-sdxl-1.0
     max_side = max(CW, CH)
@@ -127,18 +130,33 @@ def draw_bodypose(canvas: np.ndarray, keypoints: List[Keypoint], xinsr_stick_sca
 
         if keypoint1 is None or keypoint2 is None:
             continue
+            
+        # Skip drawing if confidence is too low
+        if (hasattr(keypoint1, 'score') and keypoint1.score < 0.5) or \
+           (hasattr(keypoint2, 'score') and keypoint2.score < 0.5):
+            continue
 
         Y = np.array([keypoint1.x, keypoint2.x]) * float(W)
         X = np.array([keypoint1.y, keypoint2.y]) * float(H)
+        
+        length = ((X[0] - X[1]) ** 2 + (Y[0] - Y[1]) ** 2) ** 0.5
+        
+        # Skip drawing if bone is too long (prevents elongated limbs)
+        if length > max_bone_length:
+            continue
+            
         mX = np.mean(X)
         mY = np.mean(Y)
-        length = ((X[0] - X[1]) ** 2 + (Y[0] - Y[1]) ** 2) ** 0.5
         angle = math.degrees(math.atan2(X[0] - X[1], Y[0] - Y[1]))
         polygon = cv2.ellipse2Poly((int(mY), int(mX)), (int(length / 2), stickwidth*stick_scale), int(angle), 0, 360, 1)
         cv2.fillConvexPoly(canvas, polygon, [int(float(c) * 0.6) for c in color])
 
     for keypoint, color in zip(keypoints, colors):
         if keypoint is None:
+            continue
+            
+        # Only draw keypoints with sufficient confidence
+        if hasattr(keypoint, 'score') and keypoint.score < 0.5:
             continue
 
         x, y = keypoint.x, keypoint.y
@@ -172,6 +190,11 @@ def draw_handpose(canvas: np.ndarray, keypoints: Union[List[Keypoint], None]) ->
     else:
         H, W, _ = canvas.shape
 
+    CH, CW, _ = canvas.shape
+    
+    # Calculate max reasonable finger segment length to prevent elongated connections
+    max_finger_length = 0.15 * ((CH**2 + CW**2)**0.5)  # 15% of image diagonal for fingers
+
     edges = [[0, 1], [1, 2], [2, 3], [3, 4], [0, 5], [5, 6], [6, 7], [7, 8], [0, 9], [9, 10], \
              [10, 11], [11, 12], [0, 13], [13, 14], [14, 15], [15, 16], [0, 17], [17, 18], [18, 19], [19, 20]]
 
@@ -181,15 +204,30 @@ def draw_handpose(canvas: np.ndarray, keypoints: Union[List[Keypoint], None]) ->
         if k1 is None or k2 is None:
             continue
         
+        # Skip drawing if either keypoint has very low confidence
+        if (hasattr(k1, 'score') and k1.score < 0.3) or \
+           (hasattr(k2, 'score') and k2.score < 0.3):
+            continue
+        
         x1 = int(k1.x * W)
         y1 = int(k1.y * H)
         x2 = int(k2.x * W)
         y2 = int(k2.y * H)
+        
         if x1 > eps and y1 > eps and x2 > eps and y2 > eps:
+            # Calculate connection length and skip if too long (prevents elongated glitches)
+            length = ((x1 - x2)**2 + (y1 - y2)**2)**0.5
+            if length > max_finger_length:
+                continue  # Skip drawing elongated connections
+            
             cv2.line(canvas, (x1, y1), (x2, y2), matplotlib.colors.hsv_to_rgb([ie / float(len(edges)), 1.0, 1.0]) * 255, thickness=2)
 
     for keypoint in keypoints:
         if keypoint is None:
+            continue
+        
+        # Only draw keypoints with sufficient confidence
+        if hasattr(keypoint, 'score') and keypoint.score < 0.3:
             continue
 
         x, y = keypoint.x, keypoint.y

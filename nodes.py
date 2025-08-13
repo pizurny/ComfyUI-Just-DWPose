@@ -51,6 +51,10 @@ class DWPoseAnnotator:
                 "kalman_process_noise": ("FLOAT", {"default": 0.01, "min": 0.001, "max": 1.0, "step": 0.001}),
                 "kalman_measurement_noise": ("FLOAT", {"default": 5.0, "min": 0.1, "max": 50.0, "step": 0.1}),
                 "kalman_confidence_threshold": ("FLOAT", {"default": 0.3, "min": 0.1, "max": 1.0, "step": 0.05}),
+                # Bone validation parameters (prevents elongated/glitchy limbs)
+                "enable_bone_validation": ("BOOLEAN", {"default": True}),
+                "max_bone_ratio": ("FLOAT", {"default": 3.0, "min": 0.5, "max": 10.0, "step": 0.1}),
+                "min_keypoint_confidence": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 0.9, "step": 0.05}),
             },
             "optional": {"model_dir_override": ("STRING", {"default": ""})},
         }
@@ -279,6 +283,9 @@ class DWPoseAnnotator:
         kalman_process_noise: float,
         kalman_measurement_noise: float,
         kalman_confidence_threshold: float,
+        enable_bone_validation: bool,
+        max_bone_ratio: float,
+        min_keypoint_confidence: float,
         model_dir_override: str = "",
     ) -> Tuple[torch.Tensor, str]:
         
@@ -293,6 +300,14 @@ class DWPoseAnnotator:
             batch_size = image.shape[0]
             if batch_size > 500:
                 raise ValueError(f"Batch size {batch_size} is too large. Maximum recommended: 500")
+            
+            # Validate bone validation parameters
+            if max_bone_ratio <= 0:
+                max_bone_ratio = 2.5
+                print(f"[WARNING] Invalid max_bone_ratio, using default: {max_bone_ratio}")
+            if min_keypoint_confidence <= 0 or min_keypoint_confidence > 1.0:
+                min_keypoint_confidence = 0.5
+                print(f"[WARNING] Invalid min_keypoint_confidence, using default: {min_keypoint_confidence}")
             
             # Ensure models_dir is always a Path object
             try:
@@ -357,6 +372,9 @@ class DWPoseAnnotator:
                         allow_download=allow_download,
                         detection_threshold=detection_threshold,
                         nms_threshold=nms_threshold,
+                        enable_bone_validation=enable_bone_validation,
+                        max_bone_ratio=max_bone_ratio,
+                        min_keypoint_confidence=min_keypoint_confidence,
                     )
                     
                     # Apply Kalman filtering if enabled and available
