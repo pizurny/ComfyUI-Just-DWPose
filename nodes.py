@@ -59,8 +59,8 @@ class DWPoseAnnotator:
             "optional": {"model_dir_override": ("STRING", {"default": ""})},
         }
 
-    RETURN_TYPES = ("IMAGE", "STRING")
-    RETURN_NAMES = ("pose_image", "keypoints_json")
+    RETURN_TYPES = ("IMAGE", "STRING", "IMAGE")
+    RETURN_NAMES = ("pose_image", "keypoints_json", "proof")
     FUNCTION = "run"
 
     def _tensor_to_pil(self, t: torch.Tensor) -> Image.Image:
@@ -73,6 +73,38 @@ class DWPoseAnnotator:
             img = img.resize((target_size[1], target_size[0]), Image.LANCZOS)  # PIL uses (width, height)
         arr = np.asarray(img, dtype=np.uint8).astype(np.float32) / 255.0
         return torch.from_numpy(arr)
+
+    def _create_proof_overlay(self, original_pil: Image.Image, pose_pil: Image.Image, blend_alpha: float = 0.7) -> Image.Image:
+        """Create proof image by overlaying skeleton on original input frame."""
+        try:
+            # Ensure both images are the same size
+            if original_pil.size != pose_pil.size:
+                pose_pil = pose_pil.resize(original_pil.size, Image.LANCZOS)
+            
+            # Convert pose image to RGBA to use as overlay mask
+            pose_rgba = pose_pil.convert("RGBA")
+            
+            # Create a mask based on the non-black pixels in the pose image
+            # Black pixels (0,0,0) will be transparent, colored pixels will be visible
+            pose_array = np.array(pose_rgba)
+            
+            # Create alpha channel: transparent where pose is black, opaque where pose has skeleton
+            mask = (pose_array[:, :, 0] > 10) | (pose_array[:, :, 1] > 10) | (pose_array[:, :, 2] > 10)
+            pose_array[:, :, 3] = mask.astype(np.uint8) * int(255 * blend_alpha)
+            
+            # Create the overlay image
+            pose_overlay = Image.fromarray(pose_array, "RGBA")
+            
+            # Composite the skeleton over the original image
+            original_rgba = original_pil.convert("RGBA")
+            proof_image = Image.alpha_composite(original_rgba, pose_overlay)
+            
+            # Convert back to RGB
+            return proof_image.convert("RGB")
+            
+        except Exception as e:
+            print(f"[WARNING] Failed to create proof overlay: {e}. Using original image.")
+            return original_pil
 
     def _convert_pose_to_kalman_format(self, pose_dict):
         """Convert pose dictionary to numpy format for Kalman filtering."""
@@ -341,6 +373,7 @@ class DWPoseAnnotator:
             print(f"[Just-DWPose] Target output size: {target_size}")
             
             pose_images = []
+            proof_images = []
             all_keypoints = []
             
             # Initialize Kalman filter if enabled and filterpy is available
@@ -360,8 +393,10 @@ class DWPoseAnnotator:
                 try:
                     # Process each image in the batch
                     single_image = image[i]  # Shape: [Height, Width, Channels]
+                    original_pil = self._tensor_to_pil(single_image)
+                    
                     pose_pil, kp_dict = run_dwpose_once(
-                        self._tensor_to_pil(single_image),
+                        original_pil,
                         backend=backend,
                         detect_resolution=int(detect_resolution),
                         include_body=include_body,
@@ -405,7 +440,11 @@ class DWPoseAnnotator:
                     elif use_kalman and not KALMAN_AVAILABLE:
                         print("[WARNING] Kalman filtering requested but filterpy not available. Install with: pip install filterpy")
                         
+                    # Create proof image (original + skeleton overlay)
+                    proof_pil = self._create_proof_overlay(original_pil, pose_pil, blend_alpha=0.6)
+                        
                     pose_images.append(self._pil_to_tensor(pose_pil, target_size))
+                    proof_images.append(self._pil_to_tensor(proof_pil, target_size))
                     all_keypoints.append(kp_dict)
                     
                     # Memory cleanup for large batches
@@ -417,6 +456,7 @@ class DWPoseAnnotator:
                     # Create a black image as fallback with correct target size
                     fallback_img = Image.new('RGB', (target_size[1], target_size[0]), (0, 0, 0))  # PIL uses (width, height)
                     pose_images.append(self._pil_to_tensor(fallback_img))
+                    proof_images.append(self._pil_to_tensor(fallback_img))  # Use same fallback for proof
                     all_keypoints.append({"version": "ap10k", "people": []})
             
             # Final memory cleanup for large batches
@@ -427,11 +467,12 @@ class DWPoseAnnotator:
             
             # Stack all processed images back into batch format [Batch, Height, Width, Channels]
             batch_pose_tensor = torch.stack(pose_images, dim=0)
+            batch_proof_tensor = torch.stack(proof_images, dim=0)
             
             # Combine all keypoints into a single JSON string
             combined_keypoints = json.dumps(all_keypoints, ensure_ascii=False)
             
-            return batch_pose_tensor, combined_keypoints
+            return batch_pose_tensor, combined_keypoints, batch_proof_tensor
             
         except Exception as e:
             print(f"[ERROR] DWPose node execution failed: {e}")
@@ -453,4 +494,4 @@ class DWPoseAnnotator:
                 fallback_tensor = self._pil_to_tensor(fallback_img).unsqueeze(0)
             
             fallback_json = json.dumps([{"version": "ap10k", "people": []}])
-            return fallback_tensor, fallback_json
+            return fallback_tensor, fallback_json, fallback_tensor  # Use same fallback for proof
