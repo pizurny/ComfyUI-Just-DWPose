@@ -217,8 +217,7 @@ def _run_with_vendored_aux(
 
 def validate_bone_lengths(pose, max_bone_ratio=2.5, min_keypoint_confidence=0.5):
     """Remove connections that are unrealistically long to fix elongated bones."""
-    # Validate body AND hand keypoints - face preserved unchanged
-    pose_modified = False
+    print(f"[DWPose] BONE VALIDATION CALLED - max_ratio={max_bone_ratio}, min_confidence={min_keypoint_confidence}")
     
     # For very high ratios, skip validation entirely to preserve original behavior
     if max_bone_ratio >= 8.0:
@@ -228,30 +227,62 @@ def validate_bone_lengths(pose, max_bone_ratio=2.5, min_keypoint_confidence=0.5)
     from custom_controlnet_aux.dwpose.types import PoseResult, BodyResult, HandResult, Keypoint
     import numpy as np
     
-    # Validate BODY keypoints
-    if hasattr(pose, 'body') and pose.body and hasattr(pose.body, 'keypoints') and pose.body.keypoints:
-        pose_modified |= _validate_body_bones(pose, max_bone_ratio, min_keypoint_confidence)
+    pose_modified = False
     
-    # Validate HAND keypoints (this is likely where the glitches come from!)
-    if hasattr(pose, 'left_hand') and pose.left_hand and hasattr(pose.left_hand, 'keypoints') and pose.left_hand.keypoints:
-        pose_modified |= _validate_hand_bones(pose.left_hand, max_bone_ratio, min_keypoint_confidence, "left")
+    # Check what pose components we have
+    has_body = hasattr(pose, 'body') and pose.body and hasattr(pose.body, 'keypoints') and pose.body.keypoints
+    has_left_hand = hasattr(pose, 'left_hand') and pose.left_hand and isinstance(pose.left_hand, list)
+    has_right_hand = hasattr(pose, 'right_hand') and pose.right_hand and isinstance(pose.right_hand, list)
     
-    if hasattr(pose, 'right_hand') and pose.right_hand and hasattr(pose.right_hand, 'keypoints') and pose.right_hand.keypoints:
-        pose_modified |= _validate_hand_bones(pose.right_hand, max_bone_ratio, min_keypoint_confidence, "right")
+    print(f"[DWPose] Pose components - body: {has_body}, left_hand: {has_left_hand}, right_hand: {has_right_hand}")
     
+    # Validate BODY keypoints (currently disabled - focusing on hands)
+    if has_body:
+        print("[DWPose] Skipping body validation (focusing on hands)")
+        # pose_modified |= _validate_body_bones(pose, max_bone_ratio, min_keypoint_confidence)
+    
+    # Validate HAND keypoints (this is where the glitches come from!)
+    if has_left_hand:
+        print(f"[DWPose] Validating LEFT HAND with {len(pose.left_hand)} keypoints")
+        modified, new_left_hand = _validate_hand_bones(pose.left_hand, max_bone_ratio, min_keypoint_confidence, "left")
+        if modified:
+            # Create new pose with updated left hand
+            pose = PoseResult(pose.body, new_left_hand, pose.right_hand, pose.face)
+            pose_modified = True
+    else:
+        print("[DWPose] No left hand keypoints to validate")
+    
+    if has_right_hand:
+        print(f"[DWPose] Validating RIGHT HAND with {len(pose.right_hand)} keypoints")
+        modified, new_right_hand = _validate_hand_bones(pose.right_hand, max_bone_ratio, min_keypoint_confidence, "right")
+        if modified:
+            # Create new pose with updated right hand
+            pose = PoseResult(pose.body, pose.left_hand, new_right_hand, pose.face)
+            pose_modified = True
+    else:
+        print("[DWPose] No right hand keypoints to validate")
+    
+    print(f"[DWPose] Bone validation complete - pose_modified: {pose_modified}")
     return pose
 
-def _validate_hand_bones(hand_result, max_bone_ratio, min_keypoint_confidence, hand_side):
+def _validate_hand_bones(hand_keypoints, max_bone_ratio, min_keypoint_confidence, hand_side):
     """Validate hand bone lengths and remove elongated finger connections."""
-    if not hand_result or not hasattr(hand_result, 'keypoints') or not hand_result.keypoints:
-        return False
+    print(f"[DEBUG] _validate_hand_bones called for {hand_side} hand")
+    
+    # hand_keypoints is now a List[Keypoint] directly (HandResult is just an alias)
+    if not hand_keypoints or not isinstance(hand_keypoints, list):
+        print(f"[DEBUG] {hand_side} hand: No hand keypoints or not a list")
+        return False, hand_keypoints
     
     import numpy as np
     from custom_controlnet_aux.dwpose.types import HandResult, Keypoint
     
-    keypoints = hand_result.keypoints
+    keypoints = hand_keypoints
     if len(keypoints) < 21:  # Hand should have 21 keypoints
-        return False
+        print(f"[DEBUG] {hand_side} hand: Not enough keypoints ({len(keypoints)} < 21)")
+        return False, hand_keypoints
+    
+    print(f"[DEBUG] {hand_side} hand: Processing {len(keypoints)} keypoints with max_ratio={max_bone_ratio}")
     
     # Focus on the most problematic connections that create elongated glitches:
     # 1. Direct wrist-to-fingertip connections (these create the worst glitches)
@@ -329,16 +360,20 @@ def _validate_hand_bones(hand_result, max_bone_ratio, min_keypoint_confidence, h
     # Apply changes if we found problems but didn't remove too many points
     if removed_points and len(removed_points) < len(keypoints) // 2:  # Don't remove more than half
         try:
-            hand_result.keypoints = new_keypoints
             print(f"[DWPose] {hand_side} hand: Removed elongated connections: {', '.join(removed_points)}")
-            return True
+            print(f"[DEBUG] {hand_side} hand: Successfully modified keypoints, returning True")
+            return True, new_keypoints  # Return modified keypoints
         except Exception as e:
             print(f"[WARNING] Could not modify {hand_side} hand keypoints: {e}")
-            return False
+            print(f"[DEBUG] {hand_side} hand: Failed to modify keypoints, returning False")
+            return False, keypoints  # Return original keypoints
     elif removed_points:
         print(f"[DWPose] {hand_side} hand: Too many problems detected ({len(removed_points)}), keeping original")
+        print(f"[DEBUG] {hand_side} hand: Too many removals, returning False")
+    else:
+        print(f"[DEBUG] {hand_side} hand: No elongated connections found, returning False")
     
-    return False
+    return False, keypoints  # Return original keypoints if no changes
 
 def _validate_body_bones(pose, max_bone_ratio, min_keypoint_confidence):
     """Validate body bone lengths and remove elongated connections."""
@@ -465,42 +500,187 @@ def _run_dwpose_with_thresholds(
         # Apply bone validation to the JSON data only, then regenerate the image
         if json_dict and 'people' in json_dict and json_dict['people']:
             # Convert JSON to pose objects for validation
-            from custom_controlnet_aux.dwpose.types import PoseResult, BodyResult, Keypoint
+            from custom_controlnet_aux.dwpose.types import PoseResult, BodyResult, HandResult, FaceResult, Keypoint
             import json
             
             try:
-                # Create a simple pose object from JSON for validation
+                # Create a complete pose object from JSON for validation
                 person = json_dict['people'][0]
+                
+                # Create body keypoints
+                temp_body = None
                 if 'pose_keypoints_2d' in person:
-                    # Create temporary pose object for validation
                     temp_keypoints = []
                     kp_data = person['pose_keypoints_2d']
                     for i in range(0, len(kp_data), 3):
                         if i + 2 < len(kp_data):
                             temp_keypoints.append(Keypoint(kp_data[i], kp_data[i+1], kp_data[i+2], i//3))
-                    
-                    # Create temporary body and pose for validation
                     temp_body = BodyResult(temp_keypoints, 1.0, len(temp_keypoints))
-                    temp_pose = PoseResult(temp_body, None, None, None)
-                    
-                    # Apply bone validation
-                    validated_pose = validate_bone_lengths(temp_pose, max_bone_ratio, min_keypoint_confidence)
-                    
-                    # Update JSON with validated keypoints
-                    if validated_pose.body and validated_pose.body.keypoints:
-                        new_kp_data = []
-                        for kp in validated_pose.body.keypoints:
-                            if kp:
-                                new_kp_data.extend([kp.x, kp.y, kp.score])
-                            else:
-                                new_kp_data.extend([0.0, 0.0, 0.0])
-                        json_dict['people'][0]['pose_keypoints_2d'] = new_kp_data
+                
+                # Create left hand keypoints
+                temp_left_hand = None
+                if 'hand_left_keypoints_2d' in person:
+                    hand_kp_data = person['hand_left_keypoints_2d']
+                    hand_keypoints = []
+                    for i in range(0, len(hand_kp_data), 3):
+                        if i + 2 < len(hand_kp_data):
+                            hand_keypoints.append(Keypoint(hand_kp_data[i], hand_kp_data[i+1], hand_kp_data[i+2], i//3))
+                    if any(kp.score > 0.1 for kp in hand_keypoints if kp):
+                        temp_left_hand = hand_keypoints  # HandResult is just List[Keypoint]
+                
+                # Create right hand keypoints  
+                temp_right_hand = None
+                if 'hand_right_keypoints_2d' in person:
+                    hand_kp_data = person['hand_right_keypoints_2d']
+                    hand_keypoints = []
+                    for i in range(0, len(hand_kp_data), 3):
+                        if i + 2 < len(hand_kp_data):
+                            hand_keypoints.append(Keypoint(hand_kp_data[i], hand_kp_data[i+1], hand_kp_data[i+2], i//3))
+                    if any(kp.score > 0.1 for kp in hand_keypoints if kp):
+                        temp_right_hand = hand_keypoints  # HandResult is just List[Keypoint]
+                
+                # Create face keypoints
+                temp_face = None
+                if 'face_keypoints_2d' in person:
+                    face_kp_data = person['face_keypoints_2d']
+                    face_keypoints = []
+                    for i in range(0, len(face_kp_data), 3):
+                        if i + 2 < len(face_kp_data):
+                            face_keypoints.append(Keypoint(face_kp_data[i], face_kp_data[i+1], face_kp_data[i+2], i//3))
+                    if any(kp.score > 0.1 for kp in face_keypoints if kp):
+                        temp_face = face_keypoints  # FaceResult is just List[Keypoint]
+                
+                # Create complete pose with body, hands, and face
+                temp_pose = PoseResult(temp_body, temp_left_hand, temp_right_hand, temp_face)
+                
+                print(f"[DWPose] Created pose for validation - body: {temp_body is not None}, left_hand: {temp_left_hand is not None}, right_hand: {temp_right_hand is not None}, face: {temp_face is not None}")
+                
+                # Apply bone validation (this will now include hands!)
+                validated_pose = validate_bone_lengths(temp_pose, max_bone_ratio, min_keypoint_confidence)
+                
+                # Update JSON with validated keypoints
+                if validated_pose.body and validated_pose.body.keypoints:
+                    new_kp_data = []
+                    for kp in validated_pose.body.keypoints:
+                        if kp:
+                            new_kp_data.extend([kp.x, kp.y, kp.score])
+                        else:
+                            new_kp_data.extend([0.0, 0.0, 0.0])
+                    json_dict['people'][0]['pose_keypoints_2d'] = new_kp_data
+                
+                # Update left hand keypoints  
+                if validated_pose.left_hand:  # left_hand is now a List[Keypoint] directly
+                    new_hand_data = []
+                    for kp in validated_pose.left_hand:
+                        if kp:
+                            new_hand_data.extend([kp.x, kp.y, kp.score])
+                        else:
+                            new_hand_data.extend([0.0, 0.0, 0.0])
+                    json_dict['people'][0]['hand_left_keypoints_2d'] = new_hand_data
+                
+                # Update right hand keypoints
+                if validated_pose.right_hand:  # right_hand is now a List[Keypoint] directly
+                    new_hand_data = []
+                    for kp in validated_pose.right_hand:
+                        if kp:
+                            new_hand_data.extend([kp.x, kp.y, kp.score])
+                        else:
+                            new_hand_data.extend([0.0, 0.0, 0.0])
+                    json_dict['people'][0]['hand_right_keypoints_2d'] = new_hand_data
                         
-                        # Regenerate pose image using the node's regeneration method
-                        # We'll use the existing regeneration from nodes.py
-                        print("[DWPose] Regenerating pose image with validated keypoints")
-                        # For now, just return the original pose_img since hands/face are preserved
-                        # The bone validation only affects body keypoints
+                print("[DWPose] Applied hand bone validation and updated keypoints")
+                
+                # CRITICAL: Regenerate pose image from validated keypoints
+                try:
+                    # Convert the updated JSON back to pose objects for drawing
+                    from custom_controlnet_aux.dwpose import draw_poses
+                    from custom_controlnet_aux.util import resize_image_with_pad, HWC3
+                    
+                    # Create pose objects from validated JSON
+                    updated_poses = []
+                    for person in json_dict['people']:
+                        # Recreate body from updated JSON
+                        updated_body = None
+                        if 'pose_keypoints_2d' in person:
+                            body_keypoints = []
+                            kp_data = person['pose_keypoints_2d']
+                            for i in range(0, len(kp_data), 3):
+                                if i + 2 < len(kp_data):
+                                    x, y, conf = kp_data[i], kp_data[i+1], kp_data[i+2]
+                                    if conf > 0.1:
+                                        body_keypoints.append(Keypoint(x, y, conf, i//3))
+                                    else:
+                                        body_keypoints.append(None)
+                            updated_body = BodyResult(body_keypoints, 1.0, len(body_keypoints))
+                        
+                        # Recreate hands from updated JSON
+                        updated_left_hand = None
+                        if 'hand_left_keypoints_2d' in person:
+                            hand_kp = person['hand_left_keypoints_2d']
+                            hand_keypoints = []
+                            for i in range(0, len(hand_kp), 3):
+                                if i + 2 < len(hand_kp):
+                                    x, y, conf = hand_kp[i], hand_kp[i+1], hand_kp[i+2]
+                                    if conf > 0.1:
+                                        hand_keypoints.append(Keypoint(x, y, conf, i//3))
+                                    else:
+                                        hand_keypoints.append(None)
+                            if any(kp is not None for kp in hand_keypoints):
+                                updated_left_hand = hand_keypoints  # HandResult is just List[Keypoint]
+                        
+                        updated_right_hand = None
+                        if 'hand_right_keypoints_2d' in person:
+                            hand_kp = person['hand_right_keypoints_2d']
+                            hand_keypoints = []
+                            for i in range(0, len(hand_kp), 3):
+                                if i + 2 < len(hand_kp):
+                                    x, y, conf = hand_kp[i], hand_kp[i+1], hand_kp[i+2]
+                                    if conf > 0.1:
+                                        hand_keypoints.append(Keypoint(x, y, conf, i//3))
+                                    else:
+                                        hand_keypoints.append(None)
+                            if any(kp is not None for kp in hand_keypoints):
+                                updated_right_hand = hand_keypoints  # HandResult is just List[Keypoint]
+                        
+                        # Recreate face from updated JSON (unchanged)
+                        updated_face = None
+                        if 'face_keypoints_2d' in person:
+                            face_kp = person['face_keypoints_2d']
+                            face_keypoints = []
+                            for i in range(0, len(face_kp), 3):
+                                if i + 2 < len(face_kp):
+                                    x, y, conf = face_kp[i], face_kp[i+1], face_kp[i+2]
+                                    if conf > 0.1:
+                                        face_keypoints.append(Keypoint(x, y, conf, i//3))
+                                    else:
+                                        face_keypoints.append(None)
+                            if any(kp is not None for kp in face_keypoints):
+                                updated_face = face_keypoints  # FaceResult is just List[Keypoint]
+                        
+                        updated_poses.append(PoseResult(updated_body, updated_left_hand, updated_right_hand, updated_face))
+                    
+                    # Draw the validated poses
+                    input_image = np.array(pil_image)
+                    canvas = draw_poses(
+                        updated_poses,
+                        input_image.shape[0],
+                        input_image.shape[1],
+                        draw_body=include_body,
+                        draw_hand=include_hands,
+                        draw_face=include_face
+                    )
+                    
+                    # Resize to target resolution
+                    canvas, remove_pad = resize_image_with_pad(canvas, detect_resolution, "INTER_CUBIC")
+                    detected_map = HWC3(remove_pad(canvas))
+                    
+                    # Create new pose image from validated keypoints
+                    pose_img = Image.fromarray(detected_map, 'RGB')
+                    print("[DWPose] Successfully regenerated pose image with validated hand keypoints")
+                    
+                except Exception as regen_error:
+                    print(f"[WARNING] Failed to regenerate pose image: {regen_error}. Using original image.")
+                    # Keep original pose_img if regeneration fails
                     
             except Exception as e:
                 print(f"[WARNING] Bone validation failed: {e}. Using original pose.")
