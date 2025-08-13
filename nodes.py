@@ -294,11 +294,28 @@ class DWPoseAnnotator:
             if batch_size > 500:
                 raise ValueError(f"Batch size {batch_size} is too large. Maximum recommended: 500")
             
-            models_dir = (
-                Path(model_dir_override).expanduser().resolve()
-                if model_dir_override.strip()
-                else get_models_dir()
-            )
+            # Ensure models_dir is always a Path object
+            try:
+                models_dir = (
+                    Path(model_dir_override).expanduser().resolve()
+                    if model_dir_override.strip()
+                    else get_models_dir()
+                )
+                
+                # Check if the path looks wrong (contains "True")
+                if "True" in str(models_dir):
+                    print(f"[ERROR] Invalid models_dir detected: {models_dir}")
+                    # Use hardcoded fallback path
+                    models_dir = Path("X:/ai/Comfy_Dev/ComfyUI_windows_portable/ComfyUI/models/checkpoints/DWPose")
+                    print(f"[DEBUG] Using hardcoded fallback: {models_dir}")
+                
+                # Force conversion to ensure it's a Path object
+                models_dir = Path(models_dir)
+            except Exception as e:
+                print(f"[ERROR] Failed to resolve models_dir: {e}")
+                # Use hardcoded fallback as last resort
+                models_dir = Path("X:/ai/Comfy_Dev/ComfyUI_windows_portable/ComfyUI/models/checkpoints/DWPose")
+                print(f"[DEBUG] Emergency fallback models_dir: {models_dir}")
 
             # Handle batch processing - image tensor shape is [Batch, Height, Width, Channels]
             print(f"[Just-DWPose] Processing batch of {batch_size} images...")

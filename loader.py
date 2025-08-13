@@ -39,10 +39,13 @@ def _find_comfy_root() -> Path:
     for p in [here, *here.parents]:
         if (p / "main.py").exists() and (p / "models").exists():
             return p
-    return here.parents[2]
+    fallback = here.parents[2] if len(here.parents) > 2 else here.parent
+    return fallback
 
 def get_models_dir() -> Path:
-    return (_find_comfy_root() / "models" / "checkpoints" / "DWPose").resolve()
+    root = _find_comfy_root()
+    models_path = root / "models" / "checkpoints" / "DWPose"
+    return models_path.resolve()
 
 def _first_existing(d: Path, candidates: List[str]) -> Path | None:
     for name in candidates:
