@@ -175,6 +175,7 @@ def _run_with_vendored_aux(
     enable_bone_validation: bool = True,
     max_bone_ratio: float = 2.5,
     min_keypoint_confidence: float = 0.5,
+    person_index: int = 0,
 ) -> Tuple[Image.Image, Dict[str, Any]]:
     # Force offline behavior
     os.environ["HF_HUB_OFFLINE"] = "1"
@@ -212,6 +213,7 @@ def _run_with_vendored_aux(
         enable_bone_validation=enable_bone_validation,
         max_bone_ratio=max_bone_ratio,
         min_keypoint_confidence=min_keypoint_confidence,
+        person_index=person_index,
     )
     return pose_img, json_dict
 
@@ -466,6 +468,7 @@ def _run_dwpose_with_thresholds(
     enable_bone_validation: bool = True,
     max_bone_ratio: float = 2.5,
     min_keypoint_confidence: float = 0.5,
+    person_index: int = 0,
 ):
     """Run DWPose detection with custom thresholds by post-processing results."""
     import json
@@ -499,13 +502,21 @@ def _run_dwpose_with_thresholds(
         
         # Apply bone validation to the JSON data only, then regenerate the image
         if json_dict and 'people' in json_dict and json_dict['people']:
+            # Check if requested person index exists
+            if person_index >= len(json_dict['people']):
+                print(f"[DWPose] person_index {person_index} >= detected people ({len(json_dict['people'])}), using person 0")
+                selected_person_index = 0
+            else:
+                selected_person_index = person_index
+                print(f"[DWPose] Processing person {selected_person_index} of {len(json_dict['people'])} detected people")
+            
             # Convert JSON to pose objects for validation
             from custom_controlnet_aux.dwpose.types import PoseResult, BodyResult, HandResult, FaceResult, Keypoint
             import json
             
             try:
                 # Create a complete pose object from JSON for validation
-                person = json_dict['people'][0]
+                person = json_dict['people'][selected_person_index]
                 
                 # Create body keypoints
                 temp_body = None
@@ -566,7 +577,7 @@ def _run_dwpose_with_thresholds(
                             new_kp_data.extend([kp.x, kp.y, kp.score])
                         else:
                             new_kp_data.extend([0.0, 0.0, 0.0])
-                    json_dict['people'][0]['pose_keypoints_2d'] = new_kp_data
+                    json_dict['people'][selected_person_index]['pose_keypoints_2d'] = new_kp_data
                 
                 # Update left hand keypoints  
                 if validated_pose.left_hand:  # left_hand is now a List[Keypoint] directly
@@ -576,7 +587,7 @@ def _run_dwpose_with_thresholds(
                             new_hand_data.extend([kp.x, kp.y, kp.score])
                         else:
                             new_hand_data.extend([0.0, 0.0, 0.0])
-                    json_dict['people'][0]['hand_left_keypoints_2d'] = new_hand_data
+                    json_dict['people'][selected_person_index]['hand_left_keypoints_2d'] = new_hand_data
                 
                 # Update right hand keypoints
                 if validated_pose.right_hand:  # right_hand is now a List[Keypoint] directly
@@ -586,7 +597,7 @@ def _run_dwpose_with_thresholds(
                             new_hand_data.extend([kp.x, kp.y, kp.score])
                         else:
                             new_hand_data.extend([0.0, 0.0, 0.0])
-                    json_dict['people'][0]['hand_right_keypoints_2d'] = new_hand_data
+                    json_dict['people'][selected_person_index]['hand_right_keypoints_2d'] = new_hand_data
                         
                 print("[DWPose] Applied hand bone validation and updated keypoints")
                 
@@ -856,6 +867,7 @@ def run_dwpose_once(
     enable_bone_validation: bool = True,
     max_bone_ratio: float = 2.5,
     min_keypoint_confidence: float = 0.5,
+    person_index: int = 0,
 ) -> Tuple[Image.Image, Dict[str, Any]]:
     """
     Run DWPose once and return (overlay_image, pose_json_dict).
@@ -874,4 +886,5 @@ def run_dwpose_once(
         enable_bone_validation=enable_bone_validation,
         max_bone_ratio=max_bone_ratio,
         min_keypoint_confidence=min_keypoint_confidence,
+        person_index=person_index,
     )

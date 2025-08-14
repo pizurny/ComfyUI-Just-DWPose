@@ -56,7 +56,11 @@ class DWPoseAnnotator:
                 "max_bone_ratio": ("FLOAT", {"default": 3.0, "min": 0.5, "max": 10.0, "step": 0.1}),
                 "min_keypoint_confidence": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 0.9, "step": 0.05}),
             },
-            "optional": {"model_dir_override": ("STRING", {"default": ""})},
+            "optional": {
+                "model_dir_override": ("STRING", {"default": ""}),
+                # Multi-person selection
+                "person_index": ("STRING", {"default": "0"}),
+            },
         }
 
     RETURN_TYPES = ("IMAGE", "STRING", "IMAGE")
@@ -106,12 +110,17 @@ class DWPoseAnnotator:
             print(f"[WARNING] Failed to create proof overlay: {e}. Using original image.")
             return original_pil
 
-    def _convert_pose_to_kalman_format(self, pose_dict):
+    def _convert_pose_to_kalman_format(self, pose_dict, person_index=0):
         """Convert pose dictionary to numpy format for Kalman filtering."""
         if 'people' not in pose_dict or not pose_dict['people']:
             return None
             
-        person = pose_dict['people'][0]
+        # Check if requested person index exists
+        if person_index >= len(pose_dict['people']):
+            print(f"[WARNING] person_index {person_index} >= number of detected people ({len(pose_dict['people'])}), using person 0")
+            person_index = 0
+            
+        person = pose_dict['people'][person_index]
         
         # Combine all keypoints: body + hands + face
         all_keypoints = []
@@ -161,7 +170,7 @@ class DWPoseAnnotator:
         pose_array = np.array(all_keypoints).reshape(num_joints, 3)
         return pose_array
     
-    def _convert_kalman_to_pose_format(self, pose_array, original_dict):
+    def _convert_kalman_to_pose_format(self, pose_array, original_dict, person_index=0):
         """Convert filtered numpy pose back to original dictionary format."""
         if pose_array is None:
             return original_dict
@@ -169,12 +178,15 @@ class DWPoseAnnotator:
         # Update the pose keypoints in the dictionary
         filtered_dict = json.loads(json.dumps(original_dict))  # Deep copy
         if 'people' in filtered_dict and filtered_dict['people']:
+            # Ensure person_index is valid
+            if person_index >= len(filtered_dict['people']):
+                person_index = 0
             # Split the filtered array back into body, hands, and face
             flattened = pose_array.flatten().tolist()
             
             # Body keypoints: first 18 joints (54 values)
             body_end = 18 * 3
-            filtered_dict['people'][0]['pose_keypoints_2d'] = flattened[:body_end]
+            filtered_dict['people'][person_index]['pose_keypoints_2d'] = flattened[:body_end]
             
             # Left hand keypoints: next 21 joints (63 values)
             left_hand_start = body_end
@@ -182,7 +194,7 @@ class DWPoseAnnotator:
             left_hand_kp = flattened[left_hand_start:left_hand_end]
             # Only add if not all zeros (meaning hand was detected)
             if any(abs(x) > 0.001 for x in left_hand_kp[2::3]):  # Check confidence values
-                filtered_dict['people'][0]['hand_left_keypoints_2d'] = left_hand_kp
+                filtered_dict['people'][person_index]['hand_left_keypoints_2d'] = left_hand_kp
                 
             # Right hand keypoints: next 21 joints (63 values)  
             right_hand_start = left_hand_end
@@ -190,14 +202,14 @@ class DWPoseAnnotator:
             right_hand_kp = flattened[right_hand_start:right_hand_end]
             # Only add if not all zeros (meaning hand was detected)
             if any(abs(x) > 0.001 for x in right_hand_kp[2::3]):  # Check confidence values
-                filtered_dict['people'][0]['hand_right_keypoints_2d'] = right_hand_kp
+                filtered_dict['people'][person_index]['hand_right_keypoints_2d'] = right_hand_kp
                 
             # Face keypoints: remaining 70 joints (210 values)
             face_start = right_hand_end
             face_kp = flattened[face_start:]
             # Only add if not all zeros (meaning face was detected)
             if any(abs(x) > 0.001 for x in face_kp[2::3]):  # Check confidence values
-                filtered_dict['people'][0]['face_keypoints_2d'] = face_kp
+                filtered_dict['people'][person_index]['face_keypoints_2d'] = face_kp
             
         return filtered_dict
 
@@ -319,7 +331,8 @@ class DWPoseAnnotator:
         max_bone_ratio: float,
         min_keypoint_confidence: float,
         model_dir_override: str = "",
-    ) -> Tuple[torch.Tensor, str]:
+        person_index: str = "0",
+    ) -> Tuple[torch.Tensor, str, torch.Tensor]:
         
         try:
             # Input validation
@@ -340,6 +353,19 @@ class DWPoseAnnotator:
             if min_keypoint_confidence <= 0 or min_keypoint_confidence > 1.0:
                 min_keypoint_confidence = 0.5
                 print(f"[WARNING] Invalid min_keypoint_confidence, using default: {min_keypoint_confidence}")
+            
+            # Validate and convert person_index parameter from string to int
+            try:
+                if person_index is None or person_index == "" or person_index.strip() == "":
+                    person_index = 0
+                else:
+                    person_index = int(person_index.strip())
+                    if person_index < 0:
+                        person_index = 0
+                        print(f"[WARNING] Negative person_index, using default: {person_index}")
+            except (ValueError, TypeError, AttributeError):
+                person_index = 0
+                print(f"[WARNING] Could not convert person_index to int, using default: {person_index}")
             
             # Ensure models_dir is always a Path object
             try:
@@ -410,20 +436,21 @@ class DWPoseAnnotator:
                         enable_bone_validation=enable_bone_validation,
                         max_bone_ratio=max_bone_ratio,
                         min_keypoint_confidence=min_keypoint_confidence,
+                        person_index=person_index,
                     )
                     
                     # Apply Kalman filtering if enabled and available
                     if use_kalman and KALMAN_AVAILABLE and self.kalman_filter is not None and batch_size > 1:
                         try:
                             # Convert to Kalman format and filter
-                            pose_array = self._convert_pose_to_kalman_format(kp_dict)
+                            pose_array = self._convert_pose_to_kalman_format(kp_dict, person_index)
                             if pose_array is not None:
                                 filtered_pose_array = self.kalman_filter.update(
                                     pose_array, 
                                     confidence_threshold=kalman_confidence_threshold
                                 )
                                 # Convert back to dictionary format
-                                kp_dict = self._convert_kalman_to_pose_format(filtered_pose_array, kp_dict)
+                                kp_dict = self._convert_kalman_to_pose_format(filtered_pose_array, kp_dict, person_index)
                                 
                                 # Regenerate pose image from filtered keypoints
                                 original_image_pil = self._tensor_to_pil(single_image)
@@ -495,3 +522,386 @@ class DWPoseAnnotator:
             
             fallback_json = json.dumps([{"version": "ap10k", "people": []}])
             return fallback_tensor, fallback_json, fallback_tensor  # Use same fallback for proof
+
+
+def json_keypoints_to_pose_images(
+    keypoints_json_str: str, 
+    width: int, 
+    height: int, 
+    draw_body: bool = True, 
+    draw_hands: bool = True, 
+    draw_face: bool = True,
+    frame_index: int = -1,  # -1 means process all frames
+    point_size: int = 4,
+    bone_thickness: int = 4,
+    hand_line_thickness: int = 2
+) -> list:
+    """Convert DWPose/OpenPose JSON keypoints to pose visualization images.
+    
+    Args:
+        keypoints_json_str: JSON string with DWPose/OpenPose keypoint data
+        width: Output image width
+        height: Output image height  
+        draw_body: Whether to draw body skeleton
+        draw_hands: Whether to draw hand skeletons
+        draw_face: Whether to draw face keypoints
+        frame_index: Frame to draw (-1 = all frames, 0+ = specific frame)
+        point_size: Size of keypoint circles
+        bone_thickness: Thickness of skeleton bones
+        hand_line_thickness: Thickness of hand connection lines
+        
+    Returns:
+        List of PIL Images with pose visualizations
+    """
+    if not POSE_DRAWING_AVAILABLE:
+        return [Image.new('RGB', (width, height), (0, 0, 0))]
+    
+    try:
+        # Parse JSON keypoints
+        keypoints_data = json.loads(keypoints_json_str)
+        print(f"[DWPose Helper] Parsing JSON data: {type(keypoints_data)}")
+        
+        # Handle different JSON formats:
+        # 1. Direct OpenPose format: {"people": [...]}
+        # 2. DWPose batch format: [{"people": [...]}, {"people": [...]}]  
+        
+        frames_to_process = []
+        
+        if isinstance(keypoints_data, list):
+            # Batch format - list of dictionaries
+            if keypoints_data and isinstance(keypoints_data[0], dict):
+                if frame_index == -1:
+                    # Process all frames
+                    frames_to_process = keypoints_data
+                    print(f"[DWPose Helper] Processing all {len(keypoints_data)} frames")
+                elif frame_index < len(keypoints_data):
+                    # Process specific frame
+                    frames_to_process = [keypoints_data[frame_index]]
+                    print(f"[DWPose Helper] Processing frame {frame_index}")
+                else:
+                    # Fallback to first frame
+                    frames_to_process = [keypoints_data[0]]
+                    print(f"[DWPose Helper] Frame {frame_index} out of range, using frame 0")
+            else:
+                # Flat array format - not supported
+                print("[DWPose Helper] Unsupported flat array format")
+                return [Image.new('RGB', (width, height), (0, 0, 0))]
+        else:
+            # Single dictionary format
+            frames_to_process = [keypoints_data]
+            print("[DWPose Helper] Processing single frame")
+        
+        # Process all frames
+        result_images = []
+        
+        for frame_idx, keypoints_dict in enumerate(frames_to_process):
+            # Ensure we have the expected OpenPose format
+            if 'people' not in keypoints_dict:
+                print(f"[DWPose Helper] Frame {frame_idx}: No 'people' key")
+                result_images.append(Image.new('RGB', (width, height), (0, 0, 0)))
+                continue
+            
+            if not keypoints_dict['people'] or len(keypoints_dict['people']) == 0:
+                print(f"[DWPose Helper] Frame {frame_idx}: People array is empty")
+                result_images.append(Image.new('RGB', (width, height), (0, 0, 0)))
+                continue
+            
+            people = keypoints_dict['people']
+            # Always use the first person in the frame
+            person = people[0]
+            
+            # Convert to PoseResult format for this frame
+            pose_results = []
+            
+            # Process body keypoints
+            body_result = None
+            if 'pose_keypoints_2d' in person and draw_body:
+                keypoints_2d = person['pose_keypoints_2d']
+                body_keypoints = []
+                for i in range(0, len(keypoints_2d), 3):
+                    if i + 2 < len(keypoints_2d):
+                        x, y, conf = keypoints_2d[i], keypoints_2d[i+1], keypoints_2d[i+2]
+                        if conf > 0.1:
+                            body_keypoints.append(Keypoint(x, y, conf, len(body_keypoints)))
+                        else:
+                            body_keypoints.append(None)
+                body_result = BodyResult(body_keypoints, 1.0, len(body_keypoints))
+            
+            # Process hand keypoints
+            left_hand = None
+            right_hand = None
+            if draw_hands:
+                # Left hand
+                if 'hand_left_keypoints_2d' in person:
+                    hand_kp = person['hand_left_keypoints_2d']
+                    hand_keypoints = []
+                    for i in range(0, len(hand_kp), 3):
+                        if i + 2 < len(hand_kp):
+                            x, y, conf = hand_kp[i], hand_kp[i+1], hand_kp[i+2]
+                            if conf > 0.1:
+                                hand_keypoints.append(Keypoint(x, y, conf, len(hand_keypoints)))
+                            else:
+                                hand_keypoints.append(None)
+                    if any(kp is not None for kp in hand_keypoints):
+                        left_hand = hand_keypoints
+                
+                # Right hand
+                if 'hand_right_keypoints_2d' in person:
+                    hand_kp = person['hand_right_keypoints_2d']
+                    hand_keypoints = []
+                    for i in range(0, len(hand_kp), 3):
+                        if i + 2 < len(hand_kp):
+                            x, y, conf = hand_kp[i], hand_kp[i+1], hand_kp[i+2]
+                            if conf > 0.1:
+                                hand_keypoints.append(Keypoint(x, y, conf, len(hand_keypoints)))
+                            else:
+                                hand_keypoints.append(None)
+                    if any(kp is not None for kp in hand_keypoints):
+                        right_hand = hand_keypoints
+            
+            # Process face keypoints
+            face_result = None
+            if 'face_keypoints_2d' in person and draw_face:
+                face_kp = person['face_keypoints_2d']
+                face_keypoints = []
+                for i in range(0, len(face_kp), 3):
+                    if i + 2 < len(face_kp):
+                        x, y, conf = face_kp[i], face_kp[i+1], face_kp[i+2]
+                        if conf > 0.1:
+                            face_keypoints.append(Keypoint(x, y, conf, len(face_keypoints)))
+                        else:
+                            face_keypoints.append(None)
+                if any(kp is not None for kp in face_keypoints):
+                    face_result = face_keypoints
+            
+            # Create PoseResult for this frame
+            pose_result = PoseResult(body_result, left_hand, right_hand, face_result)
+            pose_results.append(pose_result)
+            
+            if not pose_results:
+                result_images.append(Image.new('RGB', (width, height), (0, 0, 0)))
+                continue
+            
+            # Generate pose image for this frame with custom drawing parameters
+            canvas = draw_poses_with_custom_params(
+                pose_results, height, width, 
+                draw_body=draw_body, 
+                draw_hand=draw_hands, 
+                draw_face=draw_face,
+                point_size=point_size,
+                bone_thickness=bone_thickness,
+                hand_line_thickness=hand_line_thickness
+            )
+            
+            # Convert to PIL Image and add to results
+            canvas = HWC3(canvas)
+            frame_image = Image.fromarray(canvas, 'RGB')
+            result_images.append(frame_image)
+        
+        return result_images
+        
+    except Exception as e:
+        print(f"[WARNING] Failed to convert JSON keypoints to pose images: {e}")
+        return [Image.new('RGB', (width, height), (0, 0, 0))]
+
+
+def draw_poses_with_custom_params(poses, H, W, draw_body=True, draw_hand=True, draw_face=True, 
+                                 point_size=4, bone_thickness=4, hand_line_thickness=2):
+    """Custom draw_poses function with configurable drawing parameters."""
+    if not POSE_DRAWING_AVAILABLE:
+        return np.zeros((H, W, 3), dtype=np.uint8)
+    
+    try:
+        # Import drawing utilities
+        from custom_controlnet_aux.dwpose import util
+        import cv2
+        import numpy as np
+        
+        # Create blank canvas
+        canvas = np.zeros((H, W, 3), dtype=np.uint8)
+        
+        # Draw each pose
+        for pose in poses:
+            if draw_body and pose.body:
+                canvas = draw_body_with_custom_params(canvas, pose.body.keypoints, bone_thickness, point_size)
+            
+            if draw_hand:
+                if pose.left_hand:
+                    canvas = draw_hand_with_custom_params(canvas, pose.left_hand, hand_line_thickness, point_size)
+                if pose.right_hand:
+                    canvas = draw_hand_with_custom_params(canvas, pose.right_hand, hand_line_thickness, point_size)
+            
+            if draw_face and pose.face:
+                canvas = draw_face_with_custom_params(canvas, pose.face, point_size)
+        
+        return canvas
+        
+    except Exception as e:
+        print(f"[WARNING] Custom drawing failed: {e}, falling back to default")
+        # Fallback to original drawing
+        from custom_controlnet_aux.dwpose import draw_poses
+        return draw_poses(poses, H, W, draw_body=draw_body, draw_hand=draw_hand, draw_face=draw_face)
+
+
+def draw_body_with_custom_params(canvas, keypoints, bone_thickness=4, point_size=4):
+    """Draw body pose with custom bone thickness and point size."""
+    import cv2
+    import numpy as np
+    import matplotlib.colors
+    
+    if not keypoints:
+        return canvas
+    
+    H, W, _ = canvas.shape
+    
+    # Body connections (OpenPose 18-point format)
+    limbSeq = [
+        [2, 3], [2, 6], [3, 4], [4, 5], 
+        [6, 7], [7, 8], [2, 9], [9, 10], 
+        [10, 11], [2, 12], [12, 13], [13, 14], 
+        [2, 1], [1, 15], [15, 17], [1, 16], 
+        [16, 18]
+    ]
+    
+    colors = [[255, 0, 0], [255, 85, 0], [255, 170, 0], [255, 255, 0], [170, 255, 0], [85, 255, 0], [0, 255, 0],
+              [0, 255, 85], [0, 255, 170], [0, 255, 255], [0, 170, 255], [0, 85, 255], [0, 0, 255], [85, 0, 255],
+              [170, 0, 255], [255, 0, 255], [255, 0, 170], [255, 0, 85]]
+    
+    # Draw bones
+    for i, (start_idx, end_idx) in enumerate(limbSeq):
+        start_idx -= 1  # Convert to 0-based
+        end_idx -= 1
+        
+        if (start_idx < len(keypoints) and end_idx < len(keypoints) and 
+            keypoints[start_idx] is not None and keypoints[end_idx] is not None):
+            
+            start_point = keypoints[start_idx]
+            end_point = keypoints[end_idx]
+            
+            if start_point.score > 0.1 and end_point.score > 0.1:
+                x1, y1 = int(start_point.x), int(start_point.y)
+                x2, y2 = int(end_point.x), int(end_point.y)
+                
+                color = colors[i % len(colors)]
+                cv2.line(canvas, (x1, y1), (x2, y2), color, thickness=bone_thickness)
+    
+    # Draw keypoints
+    for kp in keypoints:
+        if kp is not None and kp.score > 0.1:
+            x, y = int(kp.x), int(kp.y)
+            cv2.circle(canvas, (x, y), point_size, (0, 0, 255), thickness=-1)
+    
+    return canvas
+
+
+def draw_hand_with_custom_params(canvas, keypoints, line_thickness=2, point_size=4):
+    """Draw hand pose with custom line thickness and point size."""
+    import cv2
+    import numpy as np
+    import matplotlib.colors
+    
+    if not keypoints:
+        return canvas
+    
+    # Hand connections (21-point format)
+    edges = [
+        [0, 1], [1, 2], [2, 3], [3, 4],  # thumb
+        [0, 5], [5, 6], [6, 7], [7, 8],  # index finger
+        [0, 9], [9, 10], [10, 11], [11, 12],  # middle finger
+        [0, 13], [13, 14], [14, 15], [15, 16],  # ring finger
+        [0, 17], [17, 18], [18, 19], [19, 20]   # pinky finger
+    ]
+    
+    # Draw connections
+    for ie, (start_idx, end_idx) in enumerate(edges):
+        if (start_idx < len(keypoints) and end_idx < len(keypoints) and 
+            keypoints[start_idx] is not None and keypoints[end_idx] is not None):
+            
+            start_point = keypoints[start_idx]
+            end_point = keypoints[end_idx]
+            
+            if start_point.score > 0.1 and end_point.score > 0.1:
+                x1, y1 = int(start_point.x), int(start_point.y)
+                x2, y2 = int(end_point.x), int(end_point.y)
+                
+                color = matplotlib.colors.hsv_to_rgb([ie / float(len(edges)), 1.0, 1.0]) * 255
+                cv2.line(canvas, (x1, y1), (x2, y2), color.astype(int).tolist(), thickness=line_thickness)
+    
+    # Draw keypoints
+    for kp in keypoints:
+        if kp is not None and kp.score > 0.1:
+            x, y = int(kp.x), int(kp.y)
+            cv2.circle(canvas, (x, y), point_size, (255, 255, 255), thickness=-1)
+    
+    return canvas
+
+
+def draw_face_with_custom_params(canvas, keypoints, point_size=3):
+    """Draw face keypoints with custom point size."""
+    import cv2
+    
+    if not keypoints:
+        return canvas
+    
+    # Draw face keypoints
+    for kp in keypoints:
+        if kp is not None and kp.score > 0.1:
+            x, y = int(kp.x), int(kp.y)
+            cv2.circle(canvas, (x, y), point_size, (255, 255, 255), thickness=-1)
+    
+    return canvas
+
+
+class DWPoseJSONToImage:
+    """Helper node to convert DWPose JSON keypoints to pose visualization images."""
+    
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "keypoints_json": ("STRING", {"multiline": True, "placeholder": "Paste OpenPose JSON keypoints here..."}),
+                "width": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 8}),
+                "height": ("INT", {"default": 512, "min": 64, "max": 2048, "step": 8}),
+                "draw_body": ("BOOLEAN", {"default": True}),
+                "draw_hands": ("BOOLEAN", {"default": True}),
+                "draw_face": ("BOOLEAN", {"default": True}),
+            },
+            "optional": {
+                "point_size": ("INT", {"default": 4, "min": 1, "max": 20, "step": 1}),
+                "bone_thickness": ("INT", {"default": 4, "min": 1, "max": 20, "step": 1}),
+                "hand_line_thickness": ("INT", {"default": 2, "min": 1, "max": 10, "step": 1}),
+            }
+        }
+    
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("pose_image",)
+    FUNCTION = "convert_json_to_image"
+    CATEGORY = "DWPose"
+    DESCRIPTION = "Convert DWPose JSON keypoints to pose visualization images. Automatically processes all frames in batch data with customizable drawing parameters."
+
+    def convert_json_to_image(self, keypoints_json, width, height, draw_body, draw_hands, draw_face,
+                            point_size=4, bone_thickness=4, hand_line_thickness=2):
+        """Convert JSON keypoints to pose image tensor(s). Always processes all frames."""
+        
+        # Always process all frames
+        target_frame_index = -1
+        
+        # Generate pose images
+        pose_pil_list = json_keypoints_to_pose_images(
+            keypoints_json, width, height, draw_body, draw_hands, draw_face, 
+            target_frame_index, point_size, bone_thickness, hand_line_thickness
+        )
+        
+        # Convert PIL list to batch tensor
+        pose_tensors = []
+        for pose_pil in pose_pil_list:
+            pose_tensor = self._pil_to_tensor(pose_pil)
+            pose_tensors.append(pose_tensor)
+        
+        # Stack into batch tensor [Batch, Height, Width, Channels]
+        batch_tensor = torch.stack(pose_tensors, dim=0)
+        return (batch_tensor,)
+    
+    def _pil_to_tensor(self, pil_image):
+        """Convert PIL Image to tensor."""
+        return torch.from_numpy(np.array(pil_image).astype(np.float32) / 255.0)
