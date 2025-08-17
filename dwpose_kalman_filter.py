@@ -38,11 +38,19 @@ class DWPoseKalmanFilter:
             [0, 1, 0, 0]
         ])
 
-        # Measurement noise
-        kf.R = np.eye(2) * self.measurement_noise
+        # Add small regularization to prevent singularity
+        kf.R = np.eye(2) * self.measurement_noise + np.eye(2) * 1e-6
 
-        # Process noise
-        kf.Q = np.eye(4) * self.process_noise
+        # Better process noise model
+        kf.Q = np.array([
+            [dt**4/4, 0, dt**3/2, 0],
+            [0, dt**4/4, 0, dt**3/2],
+            [dt**3/2, 0, dt**2, 0],
+            [0, dt**3/2, 0, dt**2]
+        ]) * self.process_noise
+
+        # Initialize covariance with non-zero values
+        kf.P *= 100  # Start with high uncertainty
 
         return kf
 
@@ -50,14 +58,16 @@ class DWPoseKalmanFilter:
         """Initialize all filters with first detection"""
         self.filters = {}
         for joint_idx in range(self.num_joints):
-            if initial_pose[joint_idx, 2] > 0:  # Check confidence
+            if joint_idx < initial_pose.shape[0] and initial_pose[joint_idx, 2] > 0:
                 kf = self._create_filter()
                 kf.x = np.array([
                     initial_pose[joint_idx, 0],
                     initial_pose[joint_idx, 1],
                     0,  # Initial velocity x
-                    0  # Initial velocity y
+                    0   # Initial velocity y
                 ])
+                # Set initial covariance with uncertainty
+                kf.P = np.eye(4) * 100  # High initial uncertainty
                 self.filters[joint_idx] = kf
         self.initialized = True
 

@@ -5,8 +5,16 @@ import numpy as np
 import torch
 from PIL import Image
 import gc
+import os
 from .loader import run_dwpose_once, get_models_dir
 from .enhanced_loader import run_enhanced_dwpose
+
+# Import ComfyUI folder management if available
+try:
+    import folder_paths
+    FOLDER_PATHS_AVAILABLE = True
+except ImportError:
+    FOLDER_PATHS_AVAILABLE = False
 
 try:
     from .dwpose_kalman_filter import DWPoseKalmanFilter
@@ -117,6 +125,7 @@ class DWPoseAnnotator:
                 "model_dir_override": ("STRING", {"default": ""}),
                 # Multi-person selection
                 "person_index": ("STRING", {"default": "0"}),
+                "process_all_persons": ("BOOLEAN", {"default": False}),
             },
         }
 
@@ -397,7 +406,8 @@ class DWPoseAnnotator:
         multimodel_backends: str,
         multimodel_fusion: str,
         model_dir_override: str = "",
-        person_index: str = "0",
+        person_index: str = "0", 
+        process_all_persons: bool = False,
     ) -> Tuple[torch.Tensor, str, torch.Tensor]:
         
         try:
@@ -407,10 +417,51 @@ class DWPoseAnnotator:
             
             print(f"[Just-DWPose] Input tensor shape: {image.shape}, dtype: {image.dtype}")
             
+            # Device management - determine device consistently
+            self.device = 'cuda' if torch.cuda.is_available() and backend != 'onnx' else 'cpu'
+            
+            # Ensure input tensor is on correct device
+            if image.is_cuda and self.device == 'cpu':
+                image = image.cpu()
+                print(f"[Just-DWPose] Moved tensor from CUDA to CPU")
+            elif not image.is_cuda and self.device == 'cuda':
+                image = image.cuda()
+                print(f"[Just-DWPose] Moved tensor from CPU to CUDA")
+            
             # Check for reasonable batch size
             batch_size = image.shape[0]
             if batch_size > 500:
                 raise ValueError(f"Batch size {batch_size} is too large. Maximum recommended: 500")
+            
+            # Comprehensive parameter validation
+            if not isinstance(image, torch.Tensor):
+                raise TypeError(f"image must be torch.Tensor, got {type(image)}")
+            
+            if image.dim() != 4:
+                raise ValueError(f"image must be 4D tensor [B,H,W,C], got shape {image.shape}")
+            
+            if not (128 <= detect_resolution <= 2048):
+                raise ValueError(f"detect_resolution must be in [128, 2048], got {detect_resolution}")
+            
+            if not (0.05 <= detection_threshold <= 0.9):
+                raise ValueError(f"detection_threshold must be in [0.05, 0.9], got {detection_threshold}")
+            
+            if not (0.1 <= nms_threshold <= 0.9):
+                raise ValueError(f"nms_threshold must be in [0.1, 0.9], got {nms_threshold}")
+            
+            # Handle person selection mode
+            if process_all_persons:
+                print("[Just-DWPose] Process all persons mode enabled")
+                person_index = None  # Special value indicating all persons
+            else:
+                # Validate and fix person_index for single person mode
+                try:
+                    person_index = int(person_index) if isinstance(person_index, str) else person_index
+                    if person_index < 0:
+                        person_index = 0
+                except (ValueError, TypeError):
+                    print(f"[WARNING] Invalid person_index '{person_index}', using 0")
+                    person_index = 0
             
             # Validate bone validation parameters
             if max_bone_ratio <= 0:
@@ -444,40 +495,44 @@ class DWPoseAnnotator:
                     })
                 print(f"[Enhanced] Multi-model enabled with {len(multimodel_configs)} models")
             
-            # Validate and convert person_index parameter from string to int
-            try:
-                if person_index is None or person_index == "" or person_index.strip() == "":
-                    person_index = 0
-                else:
-                    person_index = int(person_index.strip())
-                    if person_index < 0:
-                        person_index = 0
-                        print(f"[WARNING] Negative person_index, using default: {person_index}")
-            except (ValueError, TypeError, AttributeError):
-                person_index = 0
-                print(f"[WARNING] Could not convert person_index to int, using default: {person_index}")
+            # person_index validation already done above
             
             # Ensure models_dir is always a Path object
             try:
-                models_dir = (
-                    Path(model_dir_override).expanduser().resolve()
-                    if model_dir_override.strip()
-                    else get_models_dir()
-                )
+                if model_dir_override and model_dir_override.strip():
+                    models_dir = Path(model_dir_override).expanduser().resolve()
+                else:
+                    models_dir = get_models_dir()
                 
-                # Check if the path looks wrong (contains "True")
-                if "True" in str(models_dir):
+                # Better validation and fallback
+                if not models_dir.exists() or "True" in str(models_dir):
                     print(f"[ERROR] Invalid models_dir detected: {models_dir}")
-                    # Use hardcoded fallback path
-                    models_dir = Path("X:/ai/Comfy_Dev/ComfyUI_windows_portable/ComfyUI/models/checkpoints/DWPose")
-                    print(f"[DEBUG] Using hardcoded fallback: {models_dir}")
+                    # Use ComfyUI's folder system
+                    if FOLDER_PATHS_AVAILABLE:
+                        try:
+                            base_path = folder_paths.get_folder_paths("checkpoints")[0]
+                            models_dir = Path(base_path) / "DWPose"
+                            models_dir.mkdir(parents=True, exist_ok=True)
+                            print(f"[DEBUG] Using ComfyUI folder system: {models_dir}")
+                        except Exception as e:
+                            print(f"[WARNING] ComfyUI folder system failed: {e}")
+                            # Last resort - relative to current file
+                            models_dir = Path(__file__).parent / "models" / "DWPose"
+                            models_dir.mkdir(parents=True, exist_ok=True)
+                            print(f"[DEBUG] Using relative path: {models_dir}")
+                    else:
+                        # Last resort - relative to current file
+                        models_dir = Path(__file__).parent / "models" / "DWPose"
+                        models_dir.mkdir(parents=True, exist_ok=True)
+                        print(f"[DEBUG] Using relative path: {models_dir}")
                 
                 # Force conversion to ensure it's a Path object
                 models_dir = Path(models_dir)
             except Exception as e:
                 print(f"[ERROR] Failed to resolve models_dir: {e}")
-                # Use hardcoded fallback as last resort
-                models_dir = Path("X:/ai/Comfy_Dev/ComfyUI_windows_portable/ComfyUI/models/checkpoints/DWPose")
+                # Use relative fallback as last resort
+                models_dir = Path(__file__).parent / "models" / "DWPose"
+                models_dir.mkdir(parents=True, exist_ok=True)
                 print(f"[DEBUG] Emergency fallback models_dir: {models_dir}")
 
             # Handle batch processing - image tensor shape is [Batch, Height, Width, Channels]
@@ -501,89 +556,102 @@ class DWPoseAnnotator:
                     measurement_noise=kalman_measurement_noise
                 )
             
-            for i in range(batch_size):
-                # Progress reporting for large batches
-                if batch_size > 10 and i % 10 == 0:
-                    print(f"[Just-DWPose] Processing frame {i+1}/{batch_size}")
-                    
-                try:
-                    # Process each image in the batch
-                    single_image = image[i]  # Shape: [Height, Width, Channels]
-                    original_pil = self._tensor_to_pil(single_image)
-                    
-                    pose_pil, kp_dict = run_enhanced_dwpose(
-                        original_pil,
-                        backend=backend,
-                        bbox_detector=bbox_detector,
-                        pose_estimator=pose_estimator,
-                        detect_resolution=int(detect_resolution),
-                        include_body=include_body,
-                        include_hands=include_hands,
-                        include_face=include_face,
-                        models_dir=models_dir,
-                        offline_ok=offline_ok,
-                        allow_download=allow_download,
-                        detection_threshold=detection_threshold,
-                        nms_threshold=nms_threshold,
-                        enable_bone_validation=enable_bone_validation,
-                        max_bone_ratio=max_bone_ratio,
-                        min_keypoint_confidence=min_keypoint_confidence,
-                        person_index=person_index,
-                        # Enhanced parameters
-                        enable_multiscale=enable_multiscale,
-                        multiscale_scales=scales,
-                        multiscale_fusion_method=multiscale_fusion,
-                        enable_multimodel=enable_multimodel,
-                        multimodel_configs=multimodel_configs,
-                        multimodel_fusion_method=multimodel_fusion,
-                    )
-                    
-                    # Apply Kalman filtering if enabled and available
-                    if use_kalman and KALMAN_AVAILABLE and self.kalman_filter is not None and batch_size > 1:
-                        try:
-                            # Convert to Kalman format and filter
-                            pose_array = self._convert_pose_to_kalman_format(kp_dict, person_index)
-                            if pose_array is not None:
-                                filtered_pose_array = self.kalman_filter.update(
-                                    pose_array, 
-                                    confidence_threshold=kalman_confidence_threshold
-                                )
-                                # Convert back to dictionary format
-                                kp_dict = self._convert_kalman_to_pose_format(filtered_pose_array, kp_dict, person_index)
-                                
-                                # Regenerate pose image from filtered keypoints
-                                original_image_pil = self._tensor_to_pil(single_image)
-                                filtered_pose_pil = self._regenerate_pose_image(
-                                    kp_dict, original_image_pil, detect_resolution
-                                )
-                                # Only use filtered image if it's different from original (meaning regeneration worked)
-                                if filtered_pose_pil != original_image_pil:
-                                    pose_pil = filtered_pose_pil
-                                # else: keep the original pose_pil from dwpose detection
-                                
-                        except Exception as e:
-                            print(f"[WARNING] Kalman filtering failed: {e}. Using original pose.")
-                    elif use_kalman and not KALMAN_AVAILABLE:
-                        print("[WARNING] Kalman filtering requested but filterpy not available. Install with: pip install filterpy")
+            # Add memory management for large batches
+            BATCH_CHUNK_SIZE = 10  # Process in chunks
+            
+            for chunk_start in range(0, batch_size, BATCH_CHUNK_SIZE):
+                chunk_end = min(chunk_start + BATCH_CHUNK_SIZE, batch_size)
+                
+                # Process chunk
+                for i in range(chunk_start, chunk_end):
+                    # Progress reporting for large batches
+                    if batch_size > 10 and i % 10 == 0:
+                        print(f"[Just-DWPose] Processing frame {i+1}/{batch_size}")
                         
-                    # Create proof image (original + skeleton overlay)
-                    proof_pil = self._create_proof_overlay(original_pil, pose_pil, blend_alpha=0.6)
+                    try:
+                        # Process each image in the batch
+                        single_image = image[i]  # Shape: [Height, Width, Channels]
+                        original_pil = self._tensor_to_pil(single_image)
                         
-                    pose_images.append(self._pil_to_tensor(pose_pil, target_size))
-                    proof_images.append(self._pil_to_tensor(proof_pil, target_size))
-                    all_keypoints.append(kp_dict)
-                    
-                    # Memory cleanup for large batches
-                    if batch_size > 50 and i % 25 == 0:
-                        gc.collect()
-                    
-                except Exception as e:
-                    print(f"[ERROR] Failed to process frame {i+1}/{batch_size}: {e}")
-                    # Create a black image as fallback with correct target size
-                    fallback_img = Image.new('RGB', (target_size[1], target_size[0]), (0, 0, 0))  # PIL uses (width, height)
-                    pose_images.append(self._pil_to_tensor(fallback_img))
-                    proof_images.append(self._pil_to_tensor(fallback_img))  # Use same fallback for proof
-                    all_keypoints.append({"version": "ap10k", "people": []})
+                        # Process with no_grad to save memory
+                        with torch.no_grad():
+                            pose_pil, kp_dict = run_enhanced_dwpose(
+                                original_pil,
+                                backend=backend,
+                                bbox_detector=bbox_detector,
+                                pose_estimator=pose_estimator,
+                                detect_resolution=int(detect_resolution),
+                                include_body=include_body,
+                                include_hands=include_hands,
+                                include_face=include_face,
+                                models_dir=models_dir,
+                                offline_ok=offline_ok,
+                                allow_download=allow_download,
+                                detection_threshold=detection_threshold,
+                                nms_threshold=nms_threshold,
+                                enable_bone_validation=enable_bone_validation,
+                                max_bone_ratio=max_bone_ratio,
+                                min_keypoint_confidence=min_keypoint_confidence,
+                                person_index=person_index,
+                                # Enhanced parameters
+                                enable_multiscale=enable_multiscale,
+                                multiscale_scales=scales,
+                                multiscale_fusion_method=multiscale_fusion,
+                                enable_multimodel=enable_multimodel,
+                                multimodel_configs=multimodel_configs,
+                                multimodel_fusion_method=multimodel_fusion,
+                            )
+                        
+                            # Apply Kalman filtering if enabled and available (only for single person mode)
+                            if use_kalman and KALMAN_AVAILABLE and self.kalman_filter is not None and batch_size > 1 and person_index is not None:
+                                try:
+                                    # Convert to Kalman format and filter
+                                    pose_array = self._convert_pose_to_kalman_format(kp_dict, person_index)
+                                    if pose_array is not None:
+                                        filtered_pose_array = self.kalman_filter.update(
+                                            pose_array, 
+                                            confidence_threshold=kalman_confidence_threshold
+                                        )
+                                        # Convert back to dictionary format
+                                        kp_dict = self._convert_kalman_to_pose_format(filtered_pose_array, kp_dict, person_index)
+                                        
+                                        # Regenerate pose image from filtered keypoints
+                                        original_image_pil = self._tensor_to_pil(single_image)
+                                        filtered_pose_pil = self._regenerate_pose_image(
+                                            kp_dict, original_image_pil, detect_resolution
+                                        )
+                                        # Only use filtered image if it's different from original (meaning regeneration worked)
+                                        if filtered_pose_pil != original_image_pil:
+                                            pose_pil = filtered_pose_pil
+                                        # else: keep the original pose_pil from dwpose detection
+                                        
+                                except Exception as e:
+                                    print(f"[WARNING] Kalman filtering failed: {e}. Using original pose.")
+                            elif use_kalman and not KALMAN_AVAILABLE:
+                                print("[WARNING] Kalman filtering requested but filterpy not available. Install with: pip install filterpy")
+                        
+                            # Create proof image (original + skeleton overlay)
+                            proof_pil = self._create_proof_overlay(original_pil, pose_pil, blend_alpha=0.6)
+                                
+                            pose_images.append(self._pil_to_tensor(pose_pil, target_size))
+                            proof_images.append(self._pil_to_tensor(proof_pil, target_size))
+                            all_keypoints.append(kp_dict)
+                        
+                    except Exception as e:
+                        print(f"[ERROR] Failed to process frame {i+1}/{batch_size}: {e}")
+                        # Add fallback image
+                        fallback_img = Image.new('RGB', (target_size[1], target_size[0]), (0, 0, 0))
+                        pose_images.append(self._pil_to_tensor(fallback_img))
+                        proof_images.append(self._pil_to_tensor(fallback_img))
+                        all_keypoints.append({"version": "ap10k", "people": []})
+                
+                # Clear GPU cache after each chunk
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
+                
+                # Force garbage collection for large batches
+                if batch_size > 50 and chunk_end % 50 == 0:
+                    gc.collect()
             
             # Final memory cleanup for large batches
             if batch_size > 50:

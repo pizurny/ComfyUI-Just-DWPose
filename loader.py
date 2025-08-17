@@ -26,6 +26,91 @@ from typing import Tuple, Dict, Any, List
 from PIL import Image
 import importlib
 
+# -------------------- Model Manager for Memory Management --------------------
+import gc
+try:
+    import torch
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+
+class ModelManager:
+    """Singleton model manager to prevent memory leaks and manage model lifecycle"""
+    _instance = None
+    _models = {}
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super().__new__(cls)
+        return cls._instance
+    
+    def get_model(self, model_type, *args, **kwargs):
+        """Get or create a model with caching"""
+        key = f"{model_type}_{hash(str(args) + str(sorted(kwargs.items())))}"
+        if key not in self._models:
+            if model_type == 'dwpose':
+                self._models[key] = self._create_dwpose(*args, **kwargs)
+            elif model_type == 'animalpose':
+                self._models[key] = self._create_animalpose(*args, **kwargs)
+            else:
+                raise ValueError(f"Unknown model type: {model_type}")
+        return self._models[key]
+    
+    def clear_cache(self):
+        """Clear all cached models to free memory"""
+        print("[ModelManager] Clearing model cache...")
+        for key, model in self._models.items():
+            if hasattr(model, 'det'):
+                del model.det
+            if hasattr(model, 'pose'):
+                del model.pose
+        self._models.clear()
+        
+        # Force garbage collection
+        gc.collect()
+        if TORCH_AVAILABLE and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        print("[ModelManager] Model cache cleared")
+    
+    def _create_dwpose(self, local_dir, det_name, pose_name, backend, device):
+        """Create DWPose model"""
+        ts_dev = device if backend == "torchscript" else None
+        candidates = {
+            "pretrained_model_or_path": local_dir,
+            "pose_model_or_path": local_dir,
+            "det_filename": det_name,
+            "pose_filename": pose_name,
+            "torchscript_device": ts_dev,
+            "local_files_only": True,
+        }
+
+        sig = inspect.signature(DwposeDetector.from_pretrained)
+        accepted = set(sig.parameters.keys())
+
+        # If this API uses "device" instead of "torchscript_device"
+        if "torchscript_device" not in accepted and ts_dev is not None and "device" in accepted:
+            candidates["device"] = ts_dev
+        # Remove unaccepted kwargs
+        kwargs = {k: v for k, v in candidates.items() if k in accepted and v is not None}
+
+        try:
+            return DwposeDetector.from_pretrained(**kwargs)
+        except TypeError:
+            # Very old positional style? Try minimal positional + filenames as kwargs.
+            try:
+                return DwposeDetector.from_pretrained(local_dir, det_filename=det_name, pose_filename=pose_name)
+            except TypeError:
+                # Last resort: positional only
+                return DwposeDetector.from_pretrained(local_dir)
+    
+    def _create_animalpose(self, *args, **kwargs):
+        """Create AnimalPose model (placeholder for future support)"""
+        # Placeholder for potential animal pose support
+        raise NotImplementedError("AnimalPose not yet supported")
+
+# Global model manager instance
+model_manager = ModelManager()
+
 # -------------------- Filenames we support --------------------
 TS_DET_CANDIDATES  : List[str] = ["yolox_l.torchscript.pt", "yolox_x.torchscript.pt", "yolox_s.torchscript.pt"]
 TS_POSE_CANDIDATES : List[str] = ["dw-ll_ucoco_384_bs5.torchscript.pt", "dwpose.torchscript.pt"]
@@ -41,6 +126,21 @@ def _find_comfy_root() -> Path:
             return p
     fallback = here.parents[2] if len(here.parents) > 2 else here.parent
     return fallback
+
+def safe_index_access(array, index, default=None, name="array"):
+    """Safely access array with bounds checking"""
+    if not array:
+        print(f"[WARNING] {name} is empty, returning default")
+        return default
+    
+    if index >= len(array):
+        print(f"[WARNING] {name} index {index} >= length {len(array)}, using index 0")
+        index = 0
+    elif index < 0:
+        print(f"[WARNING] {name} index {index} < 0, using index 0")
+        index = 0
+    
+    return array[index]
 
 def get_models_dir() -> Path:
     root = _find_comfy_root()
@@ -149,37 +249,15 @@ def _resolve_backend_and_paths(models_dir: Path, backend: str, bbox_detector: st
 # -------------------- Robust loader for Aux API differences --------------------
 def _load_dwpose(local_dir: str, det_name: str, pose_name: str, backend: str, device: str):
     """
-    Call DwposeDetector.from_pretrained(...) but adapt to different Aux versions.
-    We detect accepted kwargs via inspect and filter accordingly.
+    Load DwposeDetector using ModelManager for memory management.
+    Fallback to direct creation if ModelManager fails.
     """
-    ts_dev = device if backend == "torchscript" else None
-    candidates = {
-        "pretrained_model_or_path": local_dir,
-        "pose_model_or_path": local_dir,
-        "det_filename": det_name,
-        "pose_filename": pose_name,
-        "torchscript_device": ts_dev,
-        "local_files_only": True,
-    }
-
-    sig = inspect.signature(DwposeDetector.from_pretrained)
-    accepted = set(sig.parameters.keys())
-
-    # If this API uses "device" instead of "torchscript_device"
-    if "torchscript_device" not in accepted and ts_dev is not None and "device" in accepted:
-        candidates["device"] = ts_dev
-    # Remove unaccepted kwargs
-    kwargs = {k: v for k, v in candidates.items() if k in accepted and v is not None}
-
     try:
-        return DwposeDetector.from_pretrained(**kwargs)
-    except TypeError:
-        # Very old positional style? Try minimal positional + filenames as kwargs.
-        try:
-            return DwposeDetector.from_pretrained(local_dir, det_filename=det_name, pose_filename=pose_name)
-        except TypeError:
-            # Last resort: positional only
-            return DwposeDetector.from_pretrained(local_dir)
+        return model_manager.get_model('dwpose', local_dir, det_name, pose_name, backend, device)
+    except Exception as e:
+        print(f"[WARNING] ModelManager failed, using direct creation: {e}")
+        # Direct fallback creation
+        return DwposeDetector.from_pretrained(local_dir, det_filename=det_name, pose_filename=pose_name)
 
 # -------------------- DWpose run --------------------
 def _run_with_vendored_aux(
@@ -488,13 +566,95 @@ def _run_dwpose_with_thresholds(
     enable_bone_validation: bool = True,
     max_bone_ratio: float = 2.5,
     min_keypoint_confidence: float = 0.5,
-    person_index: int = 0,
+    person_index: Optional[int] = 0,
 ):
     """Run DWPose detection with custom thresholds by post-processing results."""
     import json
     import numpy as np
     from custom_controlnet_aux.dwpose import draw_poses
     from custom_controlnet_aux.dwpose.types import PoseResult, BodyResult, HandResult, FaceResult, Keypoint
+    
+    # For process all persons mode, use raw detection + custom drawing
+    if person_index is None:
+        print("[DWPose] Process all persons mode: Using raw detection with custom drawing")
+        input_image = np.array(pil_image)
+        
+        # Get ALL raw poses without any filtering
+        poses = det.detect_poses(input_image)
+        print(f"[DWPose] Detected {len(poses)} poses for all persons mode")
+        
+        # Draw ALL poses without any filtering
+        canvas = draw_poses(
+            poses, 
+            input_image.shape[0], 
+            input_image.shape[1], 
+            draw_body=include_body, 
+            draw_hand=include_hands, 
+            draw_face=include_face
+        )
+        
+        # Resize to target resolution
+        from custom_controlnet_aux.util import resize_image_with_pad, HWC3
+        canvas, remove_pad = resize_image_with_pad(canvas, detect_resolution, "INTER_CUBIC")
+        detected_map = HWC3(remove_pad(canvas))
+        
+        pose_img = Image.fromarray(detected_map, 'RGB')
+        
+        # Generate JSON dict with ALL poses
+        json_dict = {
+            "version": "ap10k",
+            "people": []
+        }
+        
+        for pose in poses:
+            person_dict = {}
+            
+            # Add body keypoints
+            if pose.body and pose.body.keypoints:
+                body_keypoints = []
+                for kp in pose.body.keypoints:
+                    if kp is not None:
+                        body_keypoints.extend([kp.x, kp.y, kp.score])
+                    else:
+                        body_keypoints.extend([0.0, 0.0, 0.0])
+                person_dict["pose_keypoints_2d"] = body_keypoints
+            
+            # Add hand keypoints
+            if pose.left_hand and pose.left_hand.keypoints:
+                hand_keypoints = []
+                for kp in pose.left_hand.keypoints:
+                    if kp is not None:
+                        hand_keypoints.extend([kp.x, kp.y, kp.score])
+                    else:
+                        hand_keypoints.extend([0.0, 0.0, 0.0])
+                person_dict["hand_left_keypoints_2d"] = hand_keypoints
+            
+            if pose.right_hand and pose.right_hand.keypoints:
+                hand_keypoints = []
+                for kp in pose.right_hand.keypoints:
+                    if kp is not None:
+                        hand_keypoints.extend([kp.x, kp.y, kp.score])
+                    else:
+                        hand_keypoints.extend([0.0, 0.0, 0.0])
+                person_dict["hand_right_keypoints_2d"] = hand_keypoints
+            
+            # Add face keypoints
+            if pose.face and pose.face.keypoints:
+                face_keypoints = []
+                for kp in pose.face.keypoints:
+                    if kp is not None:
+                        face_keypoints.extend([kp.x, kp.y, kp.score])
+                    else:
+                        face_keypoints.extend([0.0, 0.0, 0.0])
+                person_dict["face_keypoints_2d"] = face_keypoints
+            
+            json_dict["people"].append(person_dict)
+        
+        json_dict["canvas_height"] = input_image.shape[0]
+        json_dict["canvas_width"] = input_image.shape[1]
+        
+        print(f"[DWPose] All persons mode: Generated {len(json_dict['people'])} people in JSON")
+        return pose_img, json_dict
     
     # If using default threshold (0.3) AND bone validation is disabled, use original method for compatibility
     if abs(detection_threshold - 0.3) < 0.001 and not enable_bone_validation:
@@ -522,6 +682,7 @@ def _run_dwpose_with_thresholds(
         
         # Apply bone validation to the JSON data only, then regenerate the image
         if json_dict and 'people' in json_dict and json_dict['people']:
+            # Single person mode - apply bone validation to selected person
             # Check if requested person index exists
             if person_index >= len(json_dict['people']):
                 print(f"[DWPose] person_index {person_index} >= detected people ({len(json_dict['people'])}), using person 0")
@@ -536,7 +697,7 @@ def _run_dwpose_with_thresholds(
             
             try:
                 # Create a complete pose object from JSON for validation
-                person = json_dict['people'][selected_person_index]
+                person = safe_index_access(json_dict.get('people', []), selected_person_index, {}, "people")
                 
                 # Create body keypoints
                 temp_body = None
@@ -597,7 +758,9 @@ def _run_dwpose_with_thresholds(
                             new_kp_data.extend([kp.x, kp.y, kp.score])
                         else:
                             new_kp_data.extend([0.0, 0.0, 0.0])
-                    json_dict['people'][selected_person_index]['pose_keypoints_2d'] = new_kp_data
+                    # Safely update JSON people array
+                    if selected_person_index < len(json_dict['people']):
+                        json_dict['people'][selected_person_index]['pose_keypoints_2d'] = new_kp_data
                 
                 # Update left hand keypoints  
                 if validated_pose.left_hand:  # left_hand is now a List[Keypoint] directly
@@ -607,7 +770,8 @@ def _run_dwpose_with_thresholds(
                             new_hand_data.extend([kp.x, kp.y, kp.score])
                         else:
                             new_hand_data.extend([0.0, 0.0, 0.0])
-                    json_dict['people'][selected_person_index]['hand_left_keypoints_2d'] = new_hand_data
+                    if selected_person_index < len(json_dict['people']):
+                        json_dict['people'][selected_person_index]['hand_left_keypoints_2d'] = new_hand_data
                 
                 # Update right hand keypoints
                 if validated_pose.right_hand:  # right_hand is now a List[Keypoint] directly
@@ -617,7 +781,8 @@ def _run_dwpose_with_thresholds(
                             new_hand_data.extend([kp.x, kp.y, kp.score])
                         else:
                             new_hand_data.extend([0.0, 0.0, 0.0])
-                    json_dict['people'][selected_person_index]['hand_right_keypoints_2d'] = new_hand_data
+                    if selected_person_index < len(json_dict['people']):
+                        json_dict['people'][selected_person_index]['hand_right_keypoints_2d'] = new_hand_data
                         
                 print("[DWPose] Applied hand bone validation and updated keypoints")
                 
@@ -721,8 +886,10 @@ def _run_dwpose_with_thresholds(
     # For custom thresholds, use our filtering approach
     print(f"[DWPose] Using custom filtering (threshold={detection_threshold}, bone_validation={enable_bone_validation})")
     
-    # Use very low threshold for hands/face to preserve them
-    hands_face_threshold = 0.05
+    # Define separate thresholds for different body parts
+    body_threshold = detection_threshold
+    hands_face_threshold = min(0.05, detection_threshold * 0.5)  # More permissive for hands/face
+    print(f"[DWPose] Using body_threshold={body_threshold}, hands_face_threshold={hands_face_threshold}")
     
     input_image = np.array(pil_image)
     
@@ -734,11 +901,11 @@ def _run_dwpose_with_thresholds(
     filtered_poses = []
     for pose in poses:
         try:
-            # Filter body keypoints
+            # Filter body keypoints with body_threshold
             body_result = None
             if hasattr(pose, 'body') and pose.body and hasattr(pose.body, 'keypoints') and pose.body.keypoints:
                 body_keypoints = [
-                    Keypoint(kp.x, kp.y, kp.score, kp.id) if kp and kp.score >= detection_threshold else None
+                    Keypoint(kp.x, kp.y, kp.score, kp.id) if kp and kp.score >= body_threshold else None
                     for kp in pose.body.keypoints
                 ]
                 # Only keep body if at least one keypoint remains
