@@ -6,6 +6,7 @@ import torch
 from PIL import Image
 import gc
 from .loader import run_dwpose_once, get_models_dir
+from .enhanced_loader import run_enhanced_dwpose
 
 try:
     from .dwpose_kalman_filter import DWPoseKalmanFilter
@@ -27,6 +28,49 @@ try:
 except ImportError:
     POSE_DRAWING_AVAILABLE = False
 
+def _discover_available_models():
+    """Dynamically discover available DWPose models in the models directory."""
+    try:
+        models_dir = get_models_dir()
+        if not models_dir or not models_dir.exists():
+            # Fallback to hardcoded options if models dir not found
+            return {
+                "bbox_detectors": ["auto", "yolox_l.torchscript.pt", "yolox_l.onnx"],
+                "pose_estimators": ["auto", "dw-ll_ucoco_384_bs5.torchscript.pt", "dw-ll_ucoco_384.onnx"]
+            }
+        
+        bbox_detectors = ["auto"]
+        pose_estimators = ["auto"]
+        
+        # Scan for detection models
+        for pattern in ["yolox*.torchscript.pt", "yolox*.onnx"]:
+            for file_path in models_dir.glob(pattern):
+                if file_path.is_file():
+                    bbox_detectors.append(file_path.name)
+        
+        # Scan for pose estimation models  
+        for pattern in ["dw-*.torchscript.pt", "dw-*.onnx", "dwpose*.torchscript.pt", "dwpose*.onnx"]:
+            for file_path in models_dir.glob(pattern):
+                if file_path.is_file():
+                    pose_estimators.append(file_path.name)
+        
+        # Remove duplicates and sort (keeping "auto" first)
+        bbox_detectors = ["auto"] + sorted(list(set(bbox_detectors[1:])))
+        pose_estimators = ["auto"] + sorted(list(set(pose_estimators[1:])))
+        
+        return {
+            "bbox_detectors": bbox_detectors,
+            "pose_estimators": pose_estimators
+        }
+        
+    except Exception as e:
+        print(f"[DWPose] Error discovering models: {e}, using defaults")
+        # Fallback to hardcoded options
+        return {
+            "bbox_detectors": ["auto", "yolox_l.torchscript.pt", "yolox_l.onnx"],
+            "pose_estimators": ["auto", "dw-ll_ucoco_384_bs5.torchscript.pt", "dw-ll_ucoco_384.onnx"]
+        }
+
 class DWPoseAnnotator:
     CATEGORY = "annotators/dwpose"
     
@@ -35,10 +79,15 @@ class DWPoseAnnotator:
 
     @classmethod
     def INPUT_TYPES(cls):
+        # Dynamically discover available models
+        available_models = _discover_available_models()
+        
         return {
             "required": {
                 "image": ("IMAGE",),
                 "backend": (["auto", "torchscript", "onnx"], {"default": "auto"}),
+                "bbox_detector": (available_models["bbox_detectors"], {"default": "auto"}),
+                "pose_estimator": (available_models["pose_estimators"], {"default": "auto"}),
                 "detect_resolution": ("INT", {"default": 768, "min": 128, "max": 2048, "step": 32}),
                 "include_body": ("BOOLEAN", {"default": True}),
                 "include_hands": ("BOOLEAN", {"default": True}),
@@ -55,6 +104,14 @@ class DWPoseAnnotator:
                 "enable_bone_validation": ("BOOLEAN", {"default": True}),
                 "max_bone_ratio": ("FLOAT", {"default": 3.0, "min": 0.5, "max": 10.0, "step": 0.1}),
                 "min_keypoint_confidence": ("FLOAT", {"default": 0.5, "min": 0.1, "max": 0.9, "step": 0.05}),
+                # Multi-scale detection parameters
+                "enable_multiscale": ("BOOLEAN", {"default": False}),
+                "multiscale_scales": ("STRING", {"default": "0.5,0.75,1.0,1.25,1.5"}),
+                "multiscale_fusion": (["weighted_average", "max_confidence", "voting"], {"default": "weighted_average"}),
+                # Multi-model ensemble parameters
+                "enable_multimodel": ("BOOLEAN", {"default": False}),
+                "multimodel_backends": ("STRING", {"default": "torchscript,onnx"}),
+                "multimodel_fusion": (["weighted_average", "voting", "best_confidence"], {"default": "weighted_average"}),
             },
             "optional": {
                 "model_dir_override": ("STRING", {"default": ""}),
@@ -315,6 +372,8 @@ class DWPoseAnnotator:
         self,
         image: torch.Tensor,
         backend: str,
+        bbox_detector: str,
+        pose_estimator: str,
         detect_resolution: int,
         include_body: bool,
         include_hands: bool,
@@ -330,6 +389,13 @@ class DWPoseAnnotator:
         enable_bone_validation: bool,
         max_bone_ratio: float,
         min_keypoint_confidence: float,
+        # Enhanced parameters
+        enable_multiscale: bool,
+        multiscale_scales: str,
+        multiscale_fusion: str,
+        enable_multimodel: bool,
+        multimodel_backends: str,
+        multimodel_fusion: str,
         model_dir_override: str = "",
         person_index: str = "0",
     ) -> Tuple[torch.Tensor, str, torch.Tensor]:
@@ -353,6 +419,30 @@ class DWPoseAnnotator:
             if min_keypoint_confidence <= 0 or min_keypoint_confidence > 1.0:
                 min_keypoint_confidence = 0.5
                 print(f"[WARNING] Invalid min_keypoint_confidence, using default: {min_keypoint_confidence}")
+            
+            # Parse multi-scale parameters
+            if enable_multiscale:
+                try:
+                    scales = [float(s.strip()) for s in multiscale_scales.split(',') if s.strip()]
+                    print(f"[Enhanced] Multi-scale enabled with scales: {scales}")
+                except:
+                    scales = [0.5, 0.75, 1.0, 1.25, 1.5]
+                    print(f"[Enhanced] Using default scales: {scales}")
+            else:
+                scales = None
+            
+            # Parse multi-model configurations
+            multimodel_configs = None
+            if enable_multimodel:
+                backends = [b.strip() for b in multimodel_backends.split(',') if b.strip()]
+                multimodel_configs = []
+                for idx, b in enumerate(backends):
+                    multimodel_configs.append({
+                        'name': f'{b}_model_{idx}',
+                        'backend': b,
+                        'models_dir': model_dir_override if model_dir_override else str(get_models_dir())
+                    })
+                print(f"[Enhanced] Multi-model enabled with {len(multimodel_configs)} models")
             
             # Validate and convert person_index parameter from string to int
             try:
@@ -421,9 +511,11 @@ class DWPoseAnnotator:
                     single_image = image[i]  # Shape: [Height, Width, Channels]
                     original_pil = self._tensor_to_pil(single_image)
                     
-                    pose_pil, kp_dict = run_dwpose_once(
+                    pose_pil, kp_dict = run_enhanced_dwpose(
                         original_pil,
                         backend=backend,
+                        bbox_detector=bbox_detector,
+                        pose_estimator=pose_estimator,
                         detect_resolution=int(detect_resolution),
                         include_body=include_body,
                         include_hands=include_hands,
@@ -437,6 +529,13 @@ class DWPoseAnnotator:
                         max_bone_ratio=max_bone_ratio,
                         min_keypoint_confidence=min_keypoint_confidence,
                         person_index=person_index,
+                        # Enhanced parameters
+                        enable_multiscale=enable_multiscale,
+                        multiscale_scales=scales,
+                        multiscale_fusion_method=multiscale_fusion,
+                        enable_multimodel=enable_multimodel,
+                        multimodel_configs=multimodel_configs,
+                        multimodel_fusion_method=multimodel_fusion,
                     )
                     
                     # Apply Kalman filtering if enabled and available

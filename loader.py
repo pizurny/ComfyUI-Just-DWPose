@@ -77,7 +77,27 @@ class _Resolved:
 
 _LOGGED_ONCE = False
 
-def _resolve_backend_and_paths(models_dir: Path, backend: str) -> _Resolved:
+def _resolve_backend_and_paths(models_dir: Path, backend: str, bbox_detector: str = "auto", pose_estimator: str = "auto") -> _Resolved:
+    # Handle specific model selection
+    if bbox_detector != "auto" and pose_estimator != "auto":
+        det_path = models_dir / bbox_detector
+        pose_path = models_dir / pose_estimator
+        
+        if not det_path.is_file():
+            raise RuntimeError(f"Specified bbox detector not found: {det_path}")
+        if not pose_path.is_file():
+            raise RuntimeError(f"Specified pose estimator not found: {pose_path}")
+        
+        # Determine backend from file extensions
+        if bbox_detector.endswith('.torchscript.pt') and pose_estimator.endswith('.torchscript.pt'):
+            chosen_backend = "torchscript"
+            device = "cuda" if _torch_cuda_available() else "cpu"
+            return _Resolved(chosen_backend, det_path, pose_path, device)
+        elif bbox_detector.endswith('.onnx') and pose_estimator.endswith('.onnx'):
+            return _Resolved("onnx", det_path, pose_path, device="cpu")
+        else:
+            raise RuntimeError(f"Mismatched model types: {bbox_detector} and {pose_estimator}")
+    
     # explicit choice or auto-pick
     if backend in ("torchscript", "onnx"):
         chosen = backend
@@ -855,13 +875,15 @@ def _run_dwpose_with_thresholds(
 def run_dwpose_once(
     pil_image: Image.Image,
     backend: str,
-    detect_resolution: int,
-    include_body: bool,
-    include_hands: bool,
-    include_face: bool,
-    models_dir: Path,
-    offline_ok: bool,     # unused
-    allow_download: bool, # unused
+    bbox_detector: str = "auto",
+    pose_estimator: str = "auto",
+    detect_resolution: int = 768,
+    include_body: bool = True,
+    include_hands: bool = True,
+    include_face: bool = True,
+    models_dir: Path = None,
+    offline_ok: bool = True,     # unused
+    allow_download: bool = False, # unused
     detection_threshold: float = 0.3,
     nms_threshold: float = 0.45,
     enable_bone_validation: bool = True,
@@ -872,7 +894,7 @@ def run_dwpose_once(
     """
     Run DWPose once and return (overlay_image, pose_json_dict).
     """
-    resolved = _resolve_backend_and_paths(models_dir, backend)
+    resolved = _resolve_backend_and_paths(models_dir, backend, bbox_detector, pose_estimator)
     return _run_with_vendored_aux(
         pil_image=pil_image,
         resolved=resolved,
